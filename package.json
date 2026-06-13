@@ -1,0 +1,18 @@
+{
+  "name": "opencode-notify",
+  "version": "0.1.0",
+  "description": "opencode plugin — desktop and webhook notifications for permission requests and finished tasks",
+  "type": "module",
+  "main": "src/index.js",
+  "files": ["src"],
+  "scripts": {
+    "test": "node --experimental-vm-modules node_modules/.bin/jest"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.15.0"
+  },
+  "dependencies": {
+    "node-notifier": "^10.0.1"
+  },
+  "license": "MIT"
+}
