@@ -3,10 +3,10 @@
  *
  * Sends desktop notifications and optional webhook events when opencode:
  *   - requests a user permission  (`permission.updated`)
- *   - finishes a task and goes idle (`session.idle`)
+ *   - finalizes a todo (status transitions to `completed`) (`todo.updated`)
  *
  * Session titles are cached on `session.created` / `session.updated` so that
- * the idle handler never needs an async API call.
+ * event handlers never need an async API call.
  */
 
 import notifier from 'node-notifier';
@@ -103,11 +103,20 @@ export default async function opencodeNotify(_input, options = {}) {
   /**
    * Cache of sessionID → session title.
    * Populated by `session.created` and `session.updated`; consumed by
-   * `permission.updated` and `session.idle`.
+   * `permission.updated` and `todo.updated`.
    *
    * @type {Map<string, string>}
    */
   const sessionTitleCache = new Map();
+
+  /**
+   * Cache of sessionID → Map<todoID, status>.
+   * Tracks the last-known status of each todo per session so the `todo.updated`
+   * handler can detect transitions to `"completed"`.
+   *
+   * @type {Map<string, Map<string, string>>}
+   */
+  const todoStateCache = new Map();
 
   return {
     /**
@@ -155,25 +164,49 @@ export default async function opencodeNotify(_input, options = {}) {
         }
 
         // -----------------------------------------------------------------
-        // Session finished (task done)
+        // Todo completed
         // -----------------------------------------------------------------
-        case 'session.idle': {
-          const { sessionID } = event.properties;
+        case 'todo.updated': {
+          const { sessionID, todos } = event.properties;
           const sessionTitle = resolveSessionTitle(sessionTitleCache, sessionID);
 
-          if (desktopEnabled) {
-            sendDesktopNotification({
-              title: 'opencode \u2013 Task Done',
-              message: sessionTitle,
-            });
+          // Get or create the per-session state map
+          let sessionTodos = todoStateCache.get(sessionID);
+          const isFirstSeen = !sessionTodos;
+          if (isFirstSeen) {
+            // First time we see this session's todos: initialise the cache but
+            // do NOT fire for already-completed items (they were completed
+            // before the plugin started).
+            sessionTodos = new Map();
+            todoStateCache.set(sessionID, sessionTodos);
           }
 
-          if (webhooks.length > 0) {
-            await dispatchWebhooks(webhooks, {
-              event: 'task_done',
-              sessionID,
-              sessionTitle,
-            });
+          for (const todo of todos) {
+            const prevStatus = sessionTodos.get(todo.id);
+            const isNewlyCompleted =
+              !isFirstSeen && prevStatus !== 'completed' && todo.status === 'completed';
+
+            if (isNewlyCompleted) {
+              if (desktopEnabled) {
+                sendDesktopNotification({
+                  title: 'opencode \u2013 Todo Done',
+                  message: `${todo.content}\n${sessionTitle}`,
+                });
+              }
+
+              if (webhooks.length > 0) {
+                await dispatchWebhooks(webhooks, {
+                  event: 'todo_completed',
+                  sessionID,
+                  sessionTitle,
+                  todoID: todo.id,
+                  todoContent: todo.content,
+                });
+              }
+            }
+
+            // Update the tracker
+            sessionTodos.set(todo.id, todo.status);
           }
           break;
         }

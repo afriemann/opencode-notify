@@ -1,6 +1,6 @@
 # opencode-notify
 
-opencode plugin that sends desktop notifications and optional webhook events when opencode requests a permission or a session finishes.
+opencode plugin that sends desktop notifications and optional webhook events when opencode finalizes a todo or requests a permission.
 
 ## Installation
 
@@ -42,8 +42,8 @@ The plugin POSTs a JSON body to each configured webhook URL. Two event shapes ar
 // permission_request
 { "event": "permission_request", "sessionID": "ses_...", "sessionTitle": "Fix the login bug", "permissionTitle": "Run bash: rm -rf dist/" }
 
-// task_done
-{ "event": "task_done", "sessionID": "ses_...", "sessionTitle": "Fix the login bug" }
+// todo_completed
+{ "event": "todo_completed", "sessionID": "ses_...", "sessionTitle": "Fix the login bug", "todoID": "...", "todoContent": "Implement the fix" }
 ```
 
 ## Events
@@ -51,4 +51,4 @@ The plugin POSTs a JSON body to each configured webhook URL. Two event shapes ar
 The plugin handles the following opencode events:
 
 - **`permission.updated`** — fired when opencode raises a permission request that requires user approval. Triggers a `permission_request` notification.
-- **`session.idle`** — fired when a session finishes its current task and becomes idle. Triggers a `task_done` notification.
+- **`todo.updated`** — fired when a todo transitions to `completed`. Triggers a `todo_completed` notification.
