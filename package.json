@@ -4,7 +4,9 @@
   "description": "opencode plugin — desktop and webhook notifications for permission requests and finished tasks",
   "type": "module",
   "main": "src/index.js",
-  "files": ["src"],
+  "files": [
+    "src"
+  ],
   "scripts": {
     "test": "node --experimental-vm-modules node_modules/.bin/jest"
   },
@@ -15,5 +17,9 @@
     "get-windows": "^9.3.0",
     "node-notifier": "^10.0.1"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "allowScripts": {
+    "get-windows@9.3.0": true,
+    "msgpackr-extract@3.0.4": true
+  }
 }
