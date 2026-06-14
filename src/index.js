@@ -356,22 +356,23 @@ export default async function opencodeNotify(_input, options = {}) {
             todoStateCache.set(sessionID, sessionTodos);
           }
 
+          const skip =
+            desktopEnabled &&
+            options.skipIfFocused !== false &&
+            (await isOpencodeWindowFocused());
+
           for (const todo of todos) {
             const prevStatus = sessionTodos.get(todo.content);
             const isNewlyCompleted =
               !isFirstSeen && prevStatus !== 'completed' && todo.status === 'completed';
 
             if (isNewlyCompleted) {
-              if (desktopEnabled) {
-                const skip =
-                  options.skipIfFocused !== false && (await isOpencodeWindowFocused());
-                if (!skip) {
-                  sendDesktopNotification({
-                    title: 'opencode \u2013 Todo Done',
-                    message: `${todo.content}\n${sessionTitle}`,
-                    onClickCommand,
-                  });
-                }
+              if (desktopEnabled && !skip) {
+                sendDesktopNotification({
+                  title: 'opencode \u2013 Todo Done',
+                  message: `${todo.content}\n${sessionTitle}`,
+                  onClickCommand,
+                });
               }
 
               if (webhooks.length > 0) {

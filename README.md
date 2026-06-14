@@ -85,7 +85,7 @@ The plugin POSTs a JSON body to each configured webhook URL. Two event shapes ar
 { "event": "permission_request", "sessionID": "ses_...", "sessionTitle": "Fix the login bug", "permissionTitle": "Run bash: rm -rf dist/" }
 
 // todo_completed
-{ "event": "todo_completed", "sessionID": "ses_...", "sessionTitle": "Fix the login bug", "todoID": "...", "todoContent": "Implement the fix" }
+{ "event": "todo_completed", "sessionID": "ses_...", "sessionTitle": "Fix the login bug", "todoContent": "Implement the fix" }
 ```
 
 ## Events
