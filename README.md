@@ -26,6 +26,30 @@ Add the plugin to your `~/.config/opencode/opencode.jsonc`:
 |--------|------|---------|-------------|
 | `desktop` | `boolean` | `true` | Enable desktop notifications |
 | `webhooks` | `WebhookTarget[]` | `[]` | List of webhook targets to POST to |
+| `onClickCommand` | `string` | — | Shell command to run when the user clicks the "Focus opencode" action (Linux only). The literal string `${NODE_PID}` is replaced at runtime with the plugin's Node.js process PID. |
+
+## Click to Focus (Linux)
+
+On Linux, every desktop notification includes a **"Focus opencode"** action button rendered by `notify-send --wait`.
+
+> **Requires** `notify-send` to be installed (`libnotify-bin` on Debian/Ubuntu, `libnotify` on Arch).
+
+- **Permission notifications** use `--urgency=critical`, which may cause your compositor to raise the opencode window automatically.
+- **Todo notifications** use default urgency.
+- If `onClickCommand` is set and non-empty, it is executed via `child_process.exec` when the user clicks the action. If `onClickCommand` is absent or empty the click is a no-op (the action button is still shown but does nothing beyond dismissing the notification).
+
+### Example — Hyprland v0.55+
+
+Hyprland v0.55 introduced `hl.dsp.focus({ window })` via `hyprctl eval`. To focus the opencode window by PID, set `onClickCommand` in your `opencode.jsonc`:
+
+```jsonc
+["path/to/opencode-notify/src/index.js", {
+  "desktop": true,
+  "onClickCommand": "hyprctl eval \"hl.dsp.focus({ window = 'pid:${NODE_PID}' })\""
+}]
+```
+
+The plugin substitutes `${NODE_PID}` with `process.pid` at the moment the notification action fires, so the running opencode process is targeted correctly. `${NODE_PID}` is a placeholder in the config string — the plugin never passes it literally to the shell.
 
 ### WebhookTarget
 

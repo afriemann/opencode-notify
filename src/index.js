@@ -7,8 +7,13 @@
  *
  * Session titles are cached on `session.created` / `session.updated` so that
  * event handlers never need an async API call.
+ *
+ * On Linux, notifications include a "Focus opencode" action button powered by
+ * `notify-send --wait`.  Clicking the action runs `options.onClickCommand`
+ * (if set) with `${NODE_PID}` substituted by the actual Node.js process PID.
  */
 
+import { spawn, exec } from 'node:child_process';
 import notifier from 'node-notifier';
 
 // ---------------------------------------------------------------------------
@@ -41,18 +46,93 @@ function resolveSessionTitle(sessionTitleCache, sessionID) {
  * Sends a desktop notification, swallowing any errors to stderr so the plugin
  * never crashes opencode.
  *
- * @param {{ title: string; message: string }} opts
+ * On Linux, uses `notify-send --wait` with a "Focus opencode" action button so
+ * the user can click back into opencode.  Stdout is read asynchronously; if
+ * the action key `'default'` is received and `onClickCommand` is a non-empty
+ * string, the command is executed via `child_process.exec` (fire-and-forget).
+ * The function itself remains **synchronous** — all subprocess handling happens
+ * in callbacks without blocking the caller.
+ *
+ * On non-Linux platforms the existing `node-notifier` path is used unchanged.
+ *
+ * @param {{
+ *   title: string;
+ *   message: string;
+ *   urgency?: string;
+ *   onClickCommand?: string;
+ * }} opts
  */
-function sendDesktopNotification({ title, message }) {
-  try {
-    notifier.notify({
-      title,
-      message,
-      icon: ICON_PATH,
-      appID: APP_ID, // Windows only; silently ignored on other platforms
+function sendDesktopNotification({ title, message, urgency, onClickCommand }) {
+  if (process.platform === 'linux') {
+    // Build notify-send argument list
+    const args = ['--wait', '-A', 'default=Focus opencode', '--icon', ICON_PATH];
+    if (urgency) {
+      args.push(`--urgency=${urgency}`);
+    }
+    args.push('--', title, message);
+
+    let child;
+    try {
+      child = spawn('notify-send', args, {
+        detached: true,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+    } catch (err) {
+      console.error('[opencode-notify] Desktop notification failed:', err);
+      return;
+    }
+
+    child.on('error', (err) => {
+      console.error('[opencode-notify] Failed to spawn notify-send:', err);
     });
-  } catch (err) {
-    console.error('[opencode-notify] Desktop notification failed:', err);
+
+    // Read stdout line-by-line to detect the action key
+    let buffer = '';
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      buffer += chunk;
+      const lines = buffer.split('\n');
+      // Keep the last (possibly incomplete) fragment
+      buffer = lines.pop() ?? '';
+      for (const line of lines) {
+        // 'default' is the action key we passed to -A (default=Focus opencode)
+        if (line === 'default' && onClickCommand) {
+          const cmd = onClickCommand.replaceAll('${NODE_PID}', String(process.pid));
+          exec(cmd, (err) => {
+            if (err) {
+              console.error('[opencode-notify] onClickCommand failed:', err);
+            }
+          });
+        }
+      }
+    });
+
+    child.stdout.on('error', (err) => {
+      console.error('[opencode-notify] notify-send stdout error:', err);
+    });
+
+    child.stdout.on('close', () => {
+      // Flush any unterminated final line
+      if (buffer === 'default' && onClickCommand) {
+        const cmd = onClickCommand.replaceAll('${NODE_PID}', String(process.pid));
+        exec(cmd, (err) => {
+          if (err) console.error('[opencode-notify] onClickCommand failed:', err);
+        });
+      }
+      child.unref();
+    });
+  } else {
+    // Non-Linux: use node-notifier (unchanged behaviour)
+    try {
+      notifier.notify({
+        title,
+        message,
+        icon: ICON_PATH,
+        appID: APP_ID, // Windows only; silently ignored on other platforms
+      });
+    } catch (err) {
+      console.error('[opencode-notify] Desktop notification failed:', err);
+    }
   }
 }
 
@@ -93,12 +173,17 @@ async function dispatchWebhooks(webhooks, payload) {
  * opencode plugin factory.
  *
  * @param {{ client: unknown; $: unknown }} input  – opencode plugin input (unused directly)
- * @param {{ desktop?: boolean; webhooks?: Array<{ url: string; headers?: Record<string, string> }> }} options
+ * @param {{
+ *   desktop?: boolean;
+ *   webhooks?: Array<{ url: string; headers?: Record<string, string> }>;
+ *   onClickCommand?: string;
+ * }} options
  * @returns {Promise<import('@opencode-ai/plugin').Hooks>}
  */
 export default async function opencodeNotify(_input, options = {}) {
   const desktopEnabled = options.desktop ?? true;
   const webhooks = options.webhooks ?? [];
+  const onClickCommand = options.onClickCommand;
 
   /**
    * Cache of sessionID → session title.
@@ -149,6 +234,8 @@ export default async function opencodeNotify(_input, options = {}) {
             sendDesktopNotification({
               title: 'opencode \u2013 Permission Request',
               message: `${permission.title}\n${sessionTitle}`,
+              urgency: 'critical',
+              onClickCommand,
             });
           }
 
@@ -191,6 +278,7 @@ export default async function opencodeNotify(_input, options = {}) {
                 sendDesktopNotification({
                   title: 'opencode \u2013 Todo Done',
                   message: `${todo.content}\n${sessionTitle}`,
+                  onClickCommand,
                 });
               }
 
