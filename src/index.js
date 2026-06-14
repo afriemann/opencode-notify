@@ -195,9 +195,10 @@ export default async function opencodeNotify(_input, options = {}) {
   const sessionTitleCache = new Map();
 
   /**
-   * Cache of sessionID → Map<todoID, status>.
+   * Cache of sessionID → Map<todoContent, status>.
    * Tracks the last-known status of each todo per session so the `todo.updated`
-   * handler can detect transitions to `"completed"`.
+   * handler can detect transitions to `"completed"`. Uses todo content as the
+   * key because `todo.updated` payloads do not include an `id` field.
    *
    * @type {Map<string, Map<string, string>>}
    */
@@ -269,7 +270,7 @@ export default async function opencodeNotify(_input, options = {}) {
           }
 
           for (const todo of todos) {
-            const prevStatus = sessionTodos.get(todo.id);
+            const prevStatus = sessionTodos.get(todo.content);
             const isNewlyCompleted =
               !isFirstSeen && prevStatus !== 'completed' && todo.status === 'completed';
 
@@ -287,14 +288,13 @@ export default async function opencodeNotify(_input, options = {}) {
                   event: 'todo_completed',
                   sessionID,
                   sessionTitle,
-                  todoID: todo.id,
                   todoContent: todo.content,
                 });
               }
             }
 
             // Update the tracker
-            sessionTodos.set(todo.id, todo.status);
+            sessionTodos.set(todo.content, todo.status);
           }
           break;
         }
