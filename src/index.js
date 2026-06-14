@@ -198,6 +198,34 @@ async function collectLinuxAncestorPids(startPid) {
 }
 
 /**
+ * Returns the PID of the currently focused window via Hyprland's IPC, or
+ * `null` if Hyprland is not running, `hyprctl` is unavailable, or the call
+ * fails for any reason.
+ *
+ * @returns {Promise<number | null>}
+ */
+async function getHyprlandActiveWindowPid() {
+  return new Promise((resolve) => {
+    const child = spawn('hyprctl', ['activewindow', '-j'], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    let output = '';
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => { output += chunk; });
+    child.on('error', () => resolve(null));
+    child.on('close', (code) => {
+      if (code !== 0) return resolve(null);
+      try {
+        const { pid } = JSON.parse(output);
+        resolve(typeof pid === 'number' ? pid : null);
+      } catch {
+        resolve(null);
+      }
+    });
+  });
+}
+
+/**
  * Returns `true` when the currently focused window appears to belong to the
  * terminal emulator that is hosting this Node.js process (i.e. the user is
  * already looking at the opencode window), and `false` otherwise.
@@ -209,26 +237,31 @@ async function collectLinuxAncestorPids(startPid) {
  */
 async function isOpencodeWindowFocused() {
   try {
-    // Wayland is unsupported by get-windows; fall back to "not focused" so we
-    // still notify, but only when there is no XWayland fallback (DISPLAY unset).
-    if (process.env.WAYLAND_DISPLAY && !process.env.DISPLAY) {
-      console.error(
-        '[opencode-notify] Window focus detection unavailable on Wayland; sending notification anyway',
-      );
-      return false;
+    // Wayland-only guard: if running native Wayland with no XWayland,
+    // get-windows won't work — try Hyprland IPC first.
+    const nativeWayland = Boolean(process.env.WAYLAND_DISPLAY && !process.env.DISPLAY);
+
+    let windowOwnerPid = null;
+
+    if (!nativeWayland) {
+      const { activeWindow } = await import('get-windows');
+      const activeWindowResult = await activeWindow();
+      if (activeWindowResult != null) {
+        windowOwnerPid = activeWindowResult.owner.processId;
+      }
     }
 
-    const { activeWindow } = await import('get-windows');
-    const activeWindowResult = await activeWindow();
+    // Fallback: Hyprland IPC (works on native Wayland)
+    if (windowOwnerPid == null && process.env.HYPRLAND_INSTANCE_SIGNATURE) {
+      windowOwnerPid = await getHyprlandActiveWindowPid();
+    }
 
-    if (activeWindowResult == null) {
+    if (windowOwnerPid == null) {
       console.error(
         '[opencode-notify] Could not detect active window; sending notification anyway',
       );
       return false;
     }
-
-    const windowOwnerPid = activeWindowResult.owner.processId;
 
     let ancestors;
     if (process.platform === 'linux') {
