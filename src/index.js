@@ -24,7 +24,7 @@ import notifier from 'node-notifier';
 const APP_ID = 'opencode-notify';
 
 /** Absolute path to the bundled icon, resolved relative to this source file. */
-const ICON_PATH = new URL('../assets/opencode.png', import.meta.url).pathname;
+const ICON_PATH = new URL('./assets/opencode.png', import.meta.url).pathname;
 
 // ---------------------------------------------------------------------------
 // Helpers
