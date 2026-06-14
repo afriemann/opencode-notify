@@ -16,7 +16,6 @@
 import { readFile } from 'node:fs/promises';
 import { spawn, exec } from 'node:child_process';
 import notifier from 'node-notifier';
-import { activeWindow } from 'get-windows';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -219,6 +218,7 @@ async function isOpencodeWindowFocused() {
       return false;
     }
 
+    const { activeWindow } = await import('get-windows');
     const activeWindowResult = await activeWindow();
 
     if (activeWindowResult == null) {
