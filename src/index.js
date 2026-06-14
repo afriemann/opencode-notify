@@ -13,8 +13,10 @@
  * (if set) with `${NODE_PID}` substituted by the actual Node.js process PID.
  */
 
+import { readFile } from 'node:fs/promises';
 import { spawn, exec } from 'node:child_process';
 import notifier from 'node-notifier';
+import { activeWindow } from 'get-windows';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -166,6 +168,86 @@ async function dispatchWebhooks(webhooks, payload) {
 }
 
 // ---------------------------------------------------------------------------
+// Focus detection
+// ---------------------------------------------------------------------------
+
+/**
+ * Walks the Linux `/proc` tree from `startPid` upward, returning a Set of
+ * all ancestor PIDs (including `startPid` itself).  Falls back to a single
+ * parent hop via `process.ppid` when `/proc` is unavailable.
+ *
+ * @param {number} startPid
+ * @returns {Promise<Set<number>>}
+ */
+async function collectLinuxAncestorPids(startPid) {
+  const ancestors = new Set();
+  let pid = startPid;
+  while (pid > 1) {
+    ancestors.add(pid);
+    try {
+      const status = await readFile(`/proc/${pid}/status`, 'utf8');
+      const match = status.match(/^PPid:\s*(\d+)/m);
+      if (!match) break;
+      pid = Number(match[1]);
+    } catch {
+      // /proc unavailable — fall back to single-hop
+      ancestors.add(process.ppid);
+      break;
+    }
+  }
+  return ancestors;
+}
+
+/**
+ * Returns `true` when the currently focused window appears to belong to the
+ * terminal emulator that is hosting this Node.js process (i.e. the user is
+ * already looking at the opencode window), and `false` otherwise.
+ *
+ * Always returns `false` on error so that notifications are sent rather than
+ * silently dropped.
+ *
+ * @returns {Promise<boolean>}
+ */
+async function isOpencodeWindowFocused() {
+  try {
+    // Wayland is unsupported by get-windows; fall back to "not focused" so we
+    // still notify, but only when there is no XWayland fallback (DISPLAY unset).
+    if (process.env.WAYLAND_DISPLAY && !process.env.DISPLAY) {
+      console.error(
+        '[opencode-notify] Window focus detection unavailable on Wayland; sending notification anyway',
+      );
+      return false;
+    }
+
+    const activeWindowResult = await activeWindow();
+
+    if (activeWindowResult == null) {
+      console.error(
+        '[opencode-notify] Could not detect active window; sending notification anyway',
+      );
+      return false;
+    }
+
+    const windowOwnerPid = activeWindowResult.owner.processId;
+
+    let ancestors;
+    if (process.platform === 'linux') {
+      ancestors = await collectLinuxAncestorPids(process.pid);
+    } else {
+      // Best-effort single hop for non-Linux platforms
+      ancestors = new Set([process.pid, process.ppid]);
+    }
+
+    return ancestors.has(windowOwnerPid);
+  } catch (err) {
+    console.error(
+      `[opencode-notify] Window focus detection failed: ${err.message}; sending notification anyway`,
+    );
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Plugin entry point
 // ---------------------------------------------------------------------------
 
@@ -177,6 +259,7 @@ async function dispatchWebhooks(webhooks, payload) {
  *   desktop?: boolean;
  *   webhooks?: Array<{ url: string; headers?: Record<string, string> }>;
  *   onClickCommand?: string;
+ *   skipIfFocused?: boolean; // Defaults to true — suppress desktop notifications when the opencode window is focused
  * }} options
  * @returns {Promise<import('@opencode-ai/plugin').Hooks>}
  */
@@ -232,12 +315,16 @@ export default async function opencodeNotify(_input, options = {}) {
           const sessionTitle = resolveSessionTitle(sessionTitleCache, sessionID);
 
           if (desktopEnabled) {
-            sendDesktopNotification({
-              title: 'opencode \u2013 Permission Request',
-              message: `${permission.title}\n${sessionTitle}`,
-              urgency: 'critical',
-              onClickCommand,
-            });
+            const skip =
+              options.skipIfFocused !== false && (await isOpencodeWindowFocused());
+            if (!skip) {
+              sendDesktopNotification({
+                title: 'opencode \u2013 Permission Request',
+                message: `${permission.title}\n${sessionTitle}`,
+                urgency: 'critical',
+                onClickCommand,
+              });
+            }
           }
 
           if (webhooks.length > 0) {
@@ -276,11 +363,15 @@ export default async function opencodeNotify(_input, options = {}) {
 
             if (isNewlyCompleted) {
               if (desktopEnabled) {
-                sendDesktopNotification({
-                  title: 'opencode \u2013 Todo Done',
-                  message: `${todo.content}\n${sessionTitle}`,
-                  onClickCommand,
-                });
+                const skip =
+                  options.skipIfFocused !== false && (await isOpencodeWindowFocused());
+                if (!skip) {
+                  sendDesktopNotification({
+                    title: 'opencode \u2013 Todo Done',
+                    message: `${todo.content}\n${sessionTitle}`,
+                    onClickCommand,
+                  });
+                }
               }
 
               if (webhooks.length > 0) {
