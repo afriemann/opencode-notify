@@ -25,8 +25,26 @@ Add the plugin to your `~/.config/opencode/opencode.jsonc`:
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `desktop` | `boolean` | `true` | Enable desktop notifications |
+| `skipIfFocused` | `boolean` | `true` | Suppress desktop notifications when the opencode window is already focused. See [Focus Detection](#focus-detection) for platform caveats. |
 | `webhooks` | `WebhookTarget[]` | `[]` | List of webhook targets to POST to |
 | `onClickCommand` | `string` | — | Shell command to run when the user clicks the "Focus opencode" action (Linux only). The literal string `${NODE_PID}` is replaced at runtime with the plugin's Node.js process PID. |
+
+## Focus Detection
+
+When `skipIfFocused` is `true` (the default), the plugin suppresses desktop notifications if the opencode window is already focused — no point notifying you when you're already looking at it.
+
+Focus is detected via the [`get-windows`](https://github.com/sindresorhus/get-windows) package, which queries the active window's owner PID. The plugin walks the process tree from its own PID upward to find ancestor processes (i.e. the terminal emulator hosting opencode) and checks whether the active window belongs to one of them.
+
+| Platform | Support |
+|----------|---------|
+| Linux (X11 or XWayland) | ✅ Full support |
+| Linux (native Wayland, no `DISPLAY`) | ⚠️ Unsupported — logs a warning to stderr and sends the notification anyway |
+| macOS | ✅ Full support |
+| Windows | ✅ Full support |
+
+If detection fails for any reason (no active window returned, unexpected error), the plugin logs a warning to stderr and sends the notification — notifications are never silently dropped.
+
+To disable focus detection and always notify: set `skipIfFocused: false`.
 
 ## Click to Focus (Linux)
 
