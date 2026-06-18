@@ -2,7 +2,7 @@
  * opencode-notify – opencode plugin
  *
  * Sends desktop notifications and optional webhook events when opencode:
- *   - requests a user permission  (`permission.updated`)
+ *   - requests a user permission  (`permission.asked`)
  *   - finalizes a todo (status transitions to `completed`) (`todo.updated`)
  *   - becomes idle after a session task finishes (`session.idle`)
  *   - encounters a session error (`session.error`)
@@ -307,7 +307,7 @@ export default async function opencodeNotify(_input, options = {}) {
   /**
    * Cache of sessionID → session title.
    * Populated by `session.created` and `session.updated`; consumed by
-   * `permission.updated` and `todo.updated`.
+   * `permission.asked` and `todo.updated`.
    *
    * @type {Map<string, string>}
    */
@@ -345,7 +345,7 @@ export default async function opencodeNotify(_input, options = {}) {
         // -----------------------------------------------------------------
         // Permission request
         // -----------------------------------------------------------------
-        case 'permission.updated': {
+        case 'permission.asked': {
           const permission = event.properties;
           const { sessionID } = permission;
           const sessionTitle = resolveSessionTitle(sessionTitleCache, sessionID);
@@ -355,7 +355,7 @@ export default async function opencodeNotify(_input, options = {}) {
             // is almost always focused when a permission fires
             sendDesktopNotification({
               title: 'opencode \u2013 Permission Request',
-              message: `${permission.title}\n${sessionTitle}`,
+              message: `${permission.permission}\n${sessionTitle}`,
               urgency: 'critical',
               onClickCommand,
             });
@@ -366,7 +366,7 @@ export default async function opencodeNotify(_input, options = {}) {
               event: 'permission_request',
               sessionID,
               sessionTitle,
-              permissionTitle: permission.title,
+              permissionTitle: permission.permission,
             });
           }
           break;

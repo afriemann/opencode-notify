@@ -33,7 +33,7 @@ Add the plugin to your `~/.config/opencode/opencode.jsonc`:
 
 When `skipIfFocused` is `true` (the default), the plugin suppresses desktop notifications if the opencode window is already focused — no point notifying you when you're already looking at it.
 
-> **Note:** `permission.updated` and `question.asked` always bypass focus suppression — permission requests and questions are always delivered to the user regardless of the `skipIfFocused` setting.
+> **Note:** `permission.asked` and `question.asked` always bypass focus suppression — permission requests and questions are always delivered to the user regardless of the `skipIfFocused` setting.
 
 Focus is detected via the [`get-windows`](https://github.com/sindresorhus/get-windows) package, which queries the active window's owner PID. The plugin walks the process tree from its own PID upward to find ancestor processes (i.e. the terminal emulator hosting opencode) and checks whether the active window belongs to one of them.
 
@@ -103,7 +103,7 @@ The plugin POSTs a JSON body to each configured webhook URL. Five event shapes a
 
 The plugin handles the following opencode events:
 
-- **`permission.updated`** — fired when opencode raises a permission request that requires user approval. Triggers a `permission_request` notification. Focus suppression is always bypassed so permission requests always reach the user.
+- **`permission.asked`** — fired when opencode raises a permission request that requires user approval. Triggers a `permission_request` notification. Focus suppression is always bypassed so permission requests always reach the user.
 - **`todo.updated`** — fired when a todo transitions to `completed`. Triggers a `todo_completed` notification.
 - **`session.idle`** — fired when a session finishes and the agent becomes idle. Triggers a `session_idle` notification ("Task Done").
 - **`session.error`** — fired when a session encounters an error. Triggers a `session_error` notification ("Session Error").
