@@ -4,21 +4,30 @@ opencode plugin that sends desktop notifications and optional webhook events whe
 
 ## Installation
 
-Add the plugin to your `~/.config/opencode/opencode.jsonc`:
+Clone the repository to your `~/.config/opencode/plugins` directory and link the `index.js`:
+
+```bash
+git clone git@github.com:afriemann/opencode-notify ~/.config/opencode/plugins/opencode-notify
+cd ~/.config/opencode/plugins
+ln -s opencode-notify/src/index.js opencode-notify.js
+```
+
+opencode will then automatically load the plugin on startup.
+
+To configure options, create `~/.config/opencode/opencode-notify.json`:
 
 ```json
-"plugin": [
-  ["path/to/opencode-notify/src/index.js", {
-    "desktop": true,
-    "webhooks": [
-      {
-        "url": "https://example.com/hook",
-        "headers": { "Authorization": "Bearer TOKEN" }
-      }
-    ]
-  }]
-]
+{
+  "desktop": true,
+  "skipIfFocused": true,
+  "webhooks": [
+    { "url": "https://example.com/webhook" }
+  ],
+  "onClickCommand": "echo -ne '\007'"
+}
 ```
+
+The file is optional — omitting it uses the defaults listed in [Options](#options). If the plugin is installed as an npm package and loaded via the `"plugin"` key in `opencode.jsonc`, inline options passed there take precedence over the config file.
 
 ## Options
 

@@ -12,12 +12,14 @@
  * event handlers never need an async API call.
  *
  * On Linux, notifications include a "Focus opencode" action button powered by
- * `notify-send --wait`.  Clicking the action runs `options.onClickCommand`
+ * `notify-send --wait`.  Clicking the action runs `resolved.onClickCommand`
  * (if set) with `${NODE_PID}` substituted by the actual Node.js process PID.
  */
 
 import { readFile } from 'node:fs/promises';
 import { spawn, exec } from 'node:child_process';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import notifier from 'node-notifier';
 
 // ---------------------------------------------------------------------------
@@ -29,6 +31,44 @@ const APP_ID = 'opencode-notify';
 
 /** Absolute path to the bundled icon, resolved relative to this source file. */
 const ICON_PATH = new URL('./assets/opencode.png', import.meta.url).pathname;
+
+// ---------------------------------------------------------------------------
+// Config file
+// ---------------------------------------------------------------------------
+
+/**
+ * The conventional config file path for per-user configuration when the plugin
+ * is loaded via auto-discovery (the `*.js` symlink in `plugins/`).  When
+ * opencode loads a plugin by path rather than npm name, it cannot pass options
+ * from `opencode.jsonc`, so we fall back to this file.
+ *
+ * The file is optional — absence is not an error and results in all defaults.
+ */
+const CONFIG_FILE_PATH = join(homedir(), '.config', 'opencode', 'opencode-notify.json');
+
+/**
+ * Reads and parses the optional per-user config file.  Returns a (possibly
+ * empty) options object.  Any read or parse error is logged to stderr and
+ * treated as "no config" so the plugin still starts with defaults.
+ *
+ * @returns {Promise<Record<string, unknown>>}
+ */
+async function readConfigFile() {
+  try {
+    const raw = await readFile(CONFIG_FILE_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      console.error('[opencode-notify] Config file must be a JSON object; ignoring.');
+      return {};
+    }
+    return parsed;
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
+      console.error(`[opencode-notify] Could not read config file (${CONFIG_FILE_PATH}):`, err.message);
+    }
+    return {};
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -308,9 +348,16 @@ async function isOpencodeWindowFocused() {
  * @returns {Promise<import('@opencode-ai/plugin').Hooks>}
  */
 export default async function opencodeNotify(_input, options = {}) {
-  const desktopEnabled = options.desktop ?? true;
-  const webhooks = options.webhooks ?? [];
-  const onClickCommand = options.onClickCommand;
+  // When loaded via auto-discovery (symlink in plugins/), opencode cannot pass
+  // options from opencode.jsonc.  Read the optional config file and merge it
+  // under any caller-supplied options so the explicit form always takes
+  // precedence (npm-name install with inline options wins over the file).
+  const fileOptions = await readConfigFile();
+  const resolved = { ...fileOptions, ...options };
+
+  const desktopEnabled = resolved.desktop ?? true;
+  const webhooks = resolved.webhooks ?? [];
+  const onClickCommand = resolved.onClickCommand;
 
   /**
    * Cache of sessionID → session title.
@@ -400,7 +447,7 @@ export default async function opencodeNotify(_input, options = {}) {
 
           const skip =
             desktopEnabled &&
-            options.skipIfFocused !== false &&
+            resolved.skipIfFocused !== false &&
             (await isOpencodeWindowFocused());
 
           for (const todo of todos) {
@@ -442,7 +489,7 @@ export default async function opencodeNotify(_input, options = {}) {
 
           if (desktopEnabled) {
             const skip =
-              options.skipIfFocused !== false && (await isOpencodeWindowFocused());
+              resolved.skipIfFocused !== false && (await isOpencodeWindowFocused());
             if (!skip) {
               sendDesktopNotification({
                 title: 'opencode \u2013 Task Done',
@@ -471,7 +518,7 @@ export default async function opencodeNotify(_input, options = {}) {
 
           if (desktopEnabled) {
             const skip =
-              options.skipIfFocused !== false && (await isOpencodeWindowFocused());
+              resolved.skipIfFocused !== false && (await isOpencodeWindowFocused());
             if (!skip) {
               sendDesktopNotification({
                 title: 'opencode \u2013 Session Error',
