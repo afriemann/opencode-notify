@@ -4,6 +4,9 @@
  * Sends desktop notifications and optional webhook events when opencode:
  *   - requests a user permission  (`permission.updated`)
  *   - finalizes a todo (status transitions to `completed`) (`todo.updated`)
+ *   - becomes idle after a session task finishes (`session.idle`)
+ *   - encounters a session error (`session.error`)
+ *   - poses a question to the user (`question.asked`)
  *
  * Session titles are cached on `session.created` / `session.updated` so that
  * event handlers never need an async API call.
@@ -348,16 +351,14 @@ export default async function opencodeNotify(_input, options = {}) {
           const sessionTitle = resolveSessionTitle(sessionTitleCache, sessionID);
 
           if (desktopEnabled) {
-            const skip =
-              options.skipIfFocused !== false && (await isOpencodeWindowFocused());
-            if (!skip) {
-              sendDesktopNotification({
-                title: 'opencode \u2013 Permission Request',
-                message: `${permission.title}\n${sessionTitle}`,
-                urgency: 'critical',
-                onClickCommand,
-              });
-            }
+            // permission requests always notify regardless of focus — the terminal
+            // is almost always focused when a permission fires
+            sendDesktopNotification({
+              title: 'opencode \u2013 Permission Request',
+              message: `${permission.title}\n${sessionTitle}`,
+              urgency: 'critical',
+              onClickCommand,
+            });
           }
 
           if (webhooks.length > 0) {
@@ -420,6 +421,97 @@ export default async function opencodeNotify(_input, options = {}) {
 
             // Update the tracker
             sessionTodos.set(todo.content, todo.status);
+          }
+          break;
+        }
+
+        // -----------------------------------------------------------------
+        // Session idle (task finished)
+        // -----------------------------------------------------------------
+        case 'session.idle': {
+          const { sessionID } = event.properties;
+          const sessionTitle = resolveSessionTitle(sessionTitleCache, sessionID);
+
+          if (desktopEnabled) {
+            const skip =
+              options.skipIfFocused !== false && (await isOpencodeWindowFocused());
+            if (!skip) {
+              sendDesktopNotification({
+                title: 'opencode \u2013 Task Done',
+                message: sessionTitle,
+                onClickCommand,
+              });
+            }
+          }
+
+          if (webhooks.length > 0) {
+            await dispatchWebhooks(webhooks, {
+              event: 'session_idle',
+              sessionID,
+              sessionTitle,
+            });
+          }
+          break;
+        }
+
+        // -----------------------------------------------------------------
+        // Session error
+        // -----------------------------------------------------------------
+        case 'session.error': {
+          const { sessionID = 'unknown' } = event.properties;
+          const sessionTitle = resolveSessionTitle(sessionTitleCache, sessionID);
+
+          if (desktopEnabled) {
+            const skip =
+              options.skipIfFocused !== false && (await isOpencodeWindowFocused());
+            if (!skip) {
+              sendDesktopNotification({
+                title: 'opencode \u2013 Session Error',
+                message: sessionTitle,
+                urgency: 'critical',
+                onClickCommand,
+              });
+            }
+          }
+
+          if (webhooks.length > 0) {
+            await dispatchWebhooks(webhooks, {
+              event: 'session_error',
+              sessionID,
+              sessionTitle,
+            });
+          }
+          break;
+        }
+
+        // -----------------------------------------------------------------
+        // Question asked
+        // -----------------------------------------------------------------
+        case 'question.asked': {
+          const { sessionID, questions = [] } = event.properties;
+          const sessionTitle = resolveSessionTitle(sessionTitleCache, sessionID);
+          const notifTitle = questions[0]?.header
+            ? `opencode \u2013 ${questions[0].header}`
+            : 'opencode \u2013 Question';
+          const notifMessage = questions[0]?.question ?? sessionTitle;
+
+          if (desktopEnabled) {
+            // questions must always reach the user regardless of focus state
+            sendDesktopNotification({
+              title: notifTitle,
+              message: notifMessage,
+              onClickCommand,
+            });
+          }
+
+          if (webhooks.length > 0) {
+            await dispatchWebhooks(webhooks, {
+              event: 'question_asked',
+              sessionID,
+              sessionTitle,
+              questionHeader: questions[0]?.header,
+              questionBody: questions[0]?.question,
+            });
           }
           break;
         }

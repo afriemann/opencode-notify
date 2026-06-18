@@ -1,6 +1,6 @@
 # opencode-notify
 
-opencode plugin that sends desktop notifications and optional webhook events when opencode finalizes a todo or requests a permission.
+opencode plugin that sends desktop notifications and optional webhook events when opencode finalizes a todo, requests a permission, finishes a session, encounters an error, or asks the user a question.
 
 ## Installation
 
@@ -32,6 +32,8 @@ Add the plugin to your `~/.config/opencode/opencode.jsonc`:
 ## Focus Detection
 
 When `skipIfFocused` is `true` (the default), the plugin suppresses desktop notifications if the opencode window is already focused — no point notifying you when you're already looking at it.
+
+> **Note:** `permission.updated` and `question.asked` always bypass focus suppression — permission requests and questions are always delivered to the user regardless of the `skipIfFocused` setting.
 
 Focus is detected via the [`get-windows`](https://github.com/sindresorhus/get-windows) package, which queries the active window's owner PID. The plugin walks the process tree from its own PID upward to find ancestor processes (i.e. the terminal emulator hosting opencode) and checks whether the active window belongs to one of them.
 
@@ -78,7 +80,7 @@ The plugin substitutes `${NODE_PID}` with `process.pid` at the moment the notifi
 
 ## Webhook Payload
 
-The plugin POSTs a JSON body to each configured webhook URL. Two event shapes are emitted:
+The plugin POSTs a JSON body to each configured webhook URL. Five event shapes are emitted:
 
 ```json
 // permission_request
@@ -86,11 +88,23 @@ The plugin POSTs a JSON body to each configured webhook URL. Two event shapes ar
 
 // todo_completed
 { "event": "todo_completed", "sessionID": "ses_...", "sessionTitle": "Fix the login bug", "todoContent": "Implement the fix" }
+
+// session_idle
+{ "event": "session_idle", "sessionID": "ses_...", "sessionTitle": "Fix the login bug" }
+
+// session_error
+{ "event": "session_error", "sessionID": "ses_...", "sessionTitle": "Fix the login bug" }
+
+// question_asked
+{ "event": "question_asked", "sessionID": "ses_...", "sessionTitle": "Fix the login bug", "questionHeader": "Choose an approach", "questionBody": "Which refactoring strategy would you prefer?" }
 ```
 
 ## Events
 
 The plugin handles the following opencode events:
 
-- **`permission.updated`** — fired when opencode raises a permission request that requires user approval. Triggers a `permission_request` notification.
+- **`permission.updated`** — fired when opencode raises a permission request that requires user approval. Triggers a `permission_request` notification. Focus suppression is always bypassed so permission requests always reach the user.
 - **`todo.updated`** — fired when a todo transitions to `completed`. Triggers a `todo_completed` notification.
+- **`session.idle`** — fired when a session finishes and the agent becomes idle. Triggers a `session_idle` notification ("Task Done").
+- **`session.error`** — fired when a session encounters an error. Triggers a `session_error` notification ("Session Error").
+- **`question.asked`** — fired when opencode asks the user a question. Triggers a `question_asked` notification. Focus suppression is **always bypassed** for this event so questions always reach the user.
