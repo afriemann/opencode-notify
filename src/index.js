@@ -175,10 +175,16 @@ async function dispatchWebhooks(webhooks, payload) {
 
 /**
  * Walks the Linux `/proc` tree from `startPid` upward, returning a Set of
- * all ancestor PIDs (including `startPid` itself).  Falls back to a single
- * parent hop via `process.ppid` when `/proc` is unavailable.
+ * all ancestor PIDs (including `startPid` itself).  Falls back gracefully
+ * when `/proc` is unavailable — the set will contain at least `startPid` itself.
  *
- * @param {number} startPid
+ * Callers pass the focused window's process PID as `startPid` so that the
+ * resulting set can be checked for `process.pid` to determine whether the
+ * opencode Node process is an ancestor of the focused window (i.e. the window
+ * is hosted inside opencode's terminal session).
+ *
+ * @param {number} startPid  PID to start the upward walk from (typically the
+ *                           focused window's owner PID)
  * @returns {Promise<Set<number>>}
  */
 async function collectLinuxAncestorPids(startPid) {
@@ -192,8 +198,7 @@ async function collectLinuxAncestorPids(startPid) {
       if (!match) break;
       pid = Number(match[1]);
     } catch {
-      // /proc unavailable — fall back to single-hop
-      ancestors.add(process.ppid);
+      // /proc unavailable — startPid is already in the set; stop here.
       break;
     }
   }
@@ -266,15 +271,18 @@ async function isOpencodeWindowFocused() {
       return false;
     }
 
-    let ancestors;
     if (process.platform === 'linux') {
-      ancestors = await collectLinuxAncestorPids(process.pid);
+      // Walk upward from the focused window's process.  If process.pid
+      // (the opencode Node process) appears in that ancestry chain, the
+      // window is hosted inside opencode's terminal session.
+      const ancestors = await collectLinuxAncestorPids(windowOwnerPid);
+      return ancestors.has(process.pid);
     } else {
-      // Best-effort single hop for non-Linux platforms
-      ancestors = new Set([process.pid, process.ppid]);
+      // Non-Linux: no /proc equivalent for deep ancestry.  Best-effort: match if
+      // the focused window belongs to the opencode process itself or its direct
+      // parent (the terminal emulator that spawned it).
+      return windowOwnerPid === process.pid || windowOwnerPid === process.ppid;
     }
-
-    return ancestors.has(windowOwnerPid);
   } catch (err) {
     console.error(
       `[opencode-notify] Window focus detection failed: ${err.message}; sending notification anyway`,
