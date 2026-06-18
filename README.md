@@ -35,7 +35,7 @@ When `skipIfFocused` is `true` (the default), the plugin suppresses desktop noti
 
 > **Note:** `permission.asked` and `question.asked` always bypass focus suppression — permission requests and questions are always delivered to the user regardless of the `skipIfFocused` setting.
 
-Focus is detected via the [`get-windows`](https://github.com/sindresorhus/get-windows) package, which queries the active window's owner PID. The plugin walks the process tree from its own PID upward to find ancestor processes (i.e. the terminal emulator hosting opencode) and checks whether the active window belongs to one of them.
+Focus is detected via the [`get-windows`](https://github.com/sindresorhus/get-windows) package, which queries the active window's owner PID. On Linux the plugin walks the `/proc` tree upward from the active window's process and checks whether the opencode Node process appears in that ancestry chain — i.e. whether the focused window is hosted inside the same terminal session as opencode.
 
 | Platform | Support |
 |----------|---------|
