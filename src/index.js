@@ -507,13 +507,7 @@ async function dispatchWebhooks(webhooks, payload) {
  * all ancestor PIDs (including `startPid` itself).  Falls back gracefully
  * when `/proc` is unavailable — the set will contain at least `startPid` itself.
  *
- * Callers pass the focused window's process PID as `startPid` so that the
- * resulting set can be checked for `process.pid` to determine whether the
- * opencode Node process is an ancestor of the focused window (i.e. the window
- * is hosted inside opencode's terminal session).
- *
- * @param {number} startPid  PID to start the upward walk from (typically the
- *                           focused window's owner PID)
+ * @param {number} startPid  PID to start the upward walk from
  * @returns {Promise<Set<number>>}
  */
 async function collectLinuxAncestorPids(startPid) {
@@ -563,9 +557,65 @@ async function getHyprlandActiveWindowPid() {
 }
 
 /**
- * Returns `true` when the currently focused window appears to belong to the
- * terminal emulator that is hosting this Node.js process (i.e. the user is
+ * Returns the PID of the currently focused window via Sway's IPC, or
+ * `null` if Sway is not running, `swaymsg` is unavailable, or the call
+ * fails for any reason.
+ *
+ * Uses `swaymsg -t get_tree` and walks the JSON tree for the focused node —
+ * `get_focused_view` does not exist in Sway's IPC spec.
+ *
+ * @returns {Promise<number | null>}
+ */
+async function getSwaymsgActiveWindowPid() {
+  return new Promise((resolve) => {
+    const child = spawn('swaymsg', ['-t', 'get_tree'], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    let output = '';
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => { output += chunk; });
+    child.on('error', () => resolve(null));
+    child.on('close', (code) => {
+      if (code !== 0) return resolve(null);
+      try {
+        /** @param {unknown} node */
+        function findFocusedPid(node) {
+          if (node === null || typeof node !== 'object') return null;
+          const n = /** @type {Record<string, unknown>} */ (node);
+          if (n.focused === true && typeof n.pid === 'number') return n.pid;
+          for (const value of Object.values(n)) {
+            if (Array.isArray(value)) {
+              for (const item of value) {
+                const found = findFocusedPid(item);
+                if (found !== null) return found;
+              }
+            } else if (value !== null && typeof value === 'object') {
+              const found = findFocusedPid(value);
+              if (found !== null) return found;
+            }
+          }
+          return null;
+        }
+        resolve(findFocusedPid(JSON.parse(output)));
+      } catch {
+        resolve(null);
+      }
+    });
+  });
+}
+
+/**
+ * Returns `true` when the currently focused window belongs to the same
+ * terminal session that is hosting this Node.js process (i.e. the user is
  * already looking at the opencode window), and `false` otherwise.
+ *
+ * Strategy (Linux):
+ *   1. Obtain the focused window's owner PID via get-windows (X11 / XWayland),
+ *      Hyprland IPC, or Sway IPC — whichever is available.
+ *   2. Walk `/proc` upward from `process.pid` to collect all ancestor PIDs
+ *      (the chain: opencode → shell → terminal emulator → display server).
+ *   3. Return `true` iff the focused window's PID is in that ancestor chain —
+ *      i.e. the terminal emulator (or one of its parents) is the focused window.
  *
  * Always returns `false` on error so that notifications are sent rather than
  * silently dropped.
@@ -575,12 +625,13 @@ async function getHyprlandActiveWindowPid() {
 async function isOpencodeWindowFocused() {
   try {
     // Wayland-only guard: if running native Wayland with no XWayland,
-    // get-windows won't work — try Hyprland IPC first.
+    // get-windows won't work — try compositor IPC instead.
     const nativeWayland = Boolean(process.env.WAYLAND_DISPLAY && !process.env.DISPLAY);
 
     let windowOwnerPid = null;
 
     if (!nativeWayland) {
+      // X11 or XWayland: get-windows queries the active window via Xlib/XCB.
       const { activeWindow } = await import('get-windows');
       const activeWindowResult = await activeWindow();
       if (activeWindowResult != null) {
@@ -588,9 +639,14 @@ async function isOpencodeWindowFocused() {
       }
     }
 
-    // Fallback: Hyprland IPC (works on native Wayland)
+    // Compositor IPC fallbacks — used when get-windows returns nothing
+    // (including on native Wayland where get-windows is skipped entirely).
     if (windowOwnerPid == null && process.env.HYPRLAND_INSTANCE_SIGNATURE) {
       windowOwnerPid = await getHyprlandActiveWindowPid();
+    }
+
+    if (windowOwnerPid == null && process.env.SWAYSOCK) {
+      windowOwnerPid = await getSwaymsgActiveWindowPid();
     }
 
     if (windowOwnerPid == null) {
@@ -601,15 +657,16 @@ async function isOpencodeWindowFocused() {
     }
 
     if (process.platform === 'linux') {
-      // Walk upward from the focused window's process.  If process.pid
-      // (the opencode Node process) appears in that ancestry chain, the
-      // window is hosted inside opencode's terminal session.
-      const ancestors = await collectLinuxAncestorPids(windowOwnerPid);
-      return ancestors.has(process.pid);
+      // Walk upward from process.pid (the opencode Node process).  The chain
+      // goes: opencode → shell → terminal emulator → display server.
+      // If the focused window's PID appears in that ancestry chain, the user
+      // is looking at the terminal session that hosts opencode.
+      const ancestors = await collectLinuxAncestorPids(process.pid);
+      return ancestors.has(windowOwnerPid);
     } else {
-      // Non-Linux: no /proc equivalent for deep ancestry.  Best-effort: match if
-      // the focused window belongs to the opencode process itself or its direct
-      // parent (the terminal emulator that spawned it).
+      // Non-Linux: no /proc equivalent for deep ancestry.  Best-effort: match
+      // if the focused window belongs to the opencode process itself or its
+      // direct parent (the terminal emulator that spawned it).
       return windowOwnerPid === process.pid || windowOwnerPid === process.ppid;
     }
   } catch (err) {
