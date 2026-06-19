@@ -14,8 +14,7 @@
     "@opencode-ai/plugin": ">=1.15.0"
   },
   "dependencies": {
-    "get-windows": "^9.3.0",
-    "node-notifier": "^10.0.1"
+    "get-windows": "^9.3.0"
   },
   "license": "MIT",
   "allowScripts": {

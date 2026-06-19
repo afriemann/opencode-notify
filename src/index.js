@@ -25,12 +25,13 @@
  * signal with a short-lived `gdbus monitor` process.
  *
  * ### macOS
- * Uses `node-notifier` → `terminal-notifier`.  A caller-supplied `groupId`
- * string is passed as `-group <groupId>` and later used to dismiss via
- * `notifier.notify({ remove: groupId })`.
+ * Spawns `terminal-notifier` directly (must be installed, e.g. via Homebrew).
+ * A caller-supplied `groupId` string is passed as `-group <groupId>` and later
+ * used to dismiss via `terminal-notifier -remove <groupId>`.
  *
  * ### Windows / other
- * Uses `node-notifier`.  Dismiss is a no-op (no reliable cross-platform
+ * Spawns PowerShell with an inline WinRT script (Windows 10+ built-in, no
+ * extra dependencies).  Dismiss is a no-op (no reliable cross-platform
  * mechanism exists).
  */
 
@@ -39,7 +40,6 @@ import { spawn, exec } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import notifier from 'node-notifier';
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -115,12 +115,12 @@ function resolveSessionTitle(sessionTitleCache, sessionID) {
  * platform-specific.
  *
  * - Linux:          `{ platform: 'linux',   id: number }`
- * - macOS / other:  `{ platform: 'darwin',  groupId: string }`
- *                   `{ platform: 'other',   groupId: string }`
+ * - macOS:          `{ platform: 'darwin',  groupId: string }`
+ * - Windows/other:  `{ platform: 'other',   groupId: null }` (no dismiss mechanism)
  *
  * @typedef {{ platform: 'linux'; id: number }
  *           | { platform: 'darwin'; groupId: string }
- *           | { platform: 'other'; groupId: string }} NotificationHandle
+ *           | { platform: 'other'; groupId: null }} NotificationHandle
  */
 
 // ---------------------------------------------------------------------------
@@ -151,12 +151,13 @@ const DBUS_IFACE   = 'org.freedesktop.Notifications';
  * works.
  *
  * ### macOS
- * Uses `node-notifier` with `-group <groupId>` so the notification can later
- * be dismissed by group.  If no `groupId` is supplied a random UUID is used.
+ * Spawns `terminal-notifier` with `-group <groupId>` so the notification can
+ * later be dismissed by group.  If no `groupId` is supplied a random UUID is used.
  *
  * ### Windows / other
- * Uses `node-notifier`.  The handle is returned for API consistency but
- * `closeDesktopNotification` is a no-op on these platforms.
+ * Spawns PowerShell with an inline WinRT script (Windows 10+, no extra deps).
+ * The handle is returned for API consistency but `closeDesktopNotification`
+ * is a no-op on these platforms.
  *
  * @param {{
  *   title: string;
@@ -172,25 +173,88 @@ function sendDesktopNotification({ title, message, urgency, groupId, onClickComm
     return sendDesktopNotificationLinux({ title, message, urgency, onClickCommand });
   }
 
-  // macOS / Windows / other — node-notifier path
-  const resolvedGroupId = groupId ?? randomUUID();
-  try {
-    // node-notifier's mapToMac passes `group` as -group <id> to terminal-notifier
-    // on macOS; on other platforms it is a no-op extra property.
-    notifier.notify({
-      title,
-      message,
-      icon: ICON_PATH,
-      appID: APP_ID,   // Windows only; silently ignored on other platforms
-      group: resolvedGroupId,
-    });
-  } catch (err) {
-    console.error('[opencode-notify] Desktop notification failed:', err);
-    return Promise.resolve(null);
+  if (process.platform === 'darwin') {
+    return sendDesktopNotificationMac({ title, message, groupId });
   }
 
-  const platform = process.platform === 'darwin' ? 'darwin' : 'other';
-  return Promise.resolve({ platform, groupId: resolvedGroupId });
+  return sendDesktopNotificationWindows({ title, message });
+}
+
+/**
+ * macOS implementation — spawns `terminal-notifier` directly.
+ * Requires `terminal-notifier` to be installed (e.g. `brew install terminal-notifier`).
+ *
+ * @param {{ title: string; message: string; groupId?: string }} opts
+ * @returns {Promise<NotificationHandle | null>}
+ */
+function sendDesktopNotificationMac({ title, message, groupId }) {
+  const resolvedGroupId = groupId ?? randomUUID();
+  const args = [
+    '-title',   title,
+    '-message', message,
+    '-appIcon', ICON_PATH,
+    '-group',   resolvedGroupId,
+  ];
+
+  let child;
+  try {
+    child = spawn('terminal-notifier', args, { stdio: 'ignore' });
+  } catch (err) {
+    console.error('[opencode-notify] Failed to spawn terminal-notifier:', err);
+    return Promise.resolve(null);
+  }
+  child.on('error', (err) => {
+    console.error('[opencode-notify] terminal-notifier error:', err);
+  });
+  child.unref();
+
+  return Promise.resolve({ platform: 'darwin', groupId: resolvedGroupId });
+}
+
+/**
+ * Windows / other implementation — sends a Toast notification via an inline
+ * PowerShell WinRT script (Windows 10+ built-in, no extra dependencies).
+ * Dismiss is a no-op on this platform.
+ *
+ * @param {{ title: string; message: string }} opts
+ * @returns {Promise<NotificationHandle | null>}
+ */
+function sendDesktopNotificationWindows({ title, message }) {
+  // Escape XML special chars before embedding in the toast XML template.
+  const escXml = (s) => s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+
+  const ps = [
+    '[void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime]',
+    '[void][Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType=WindowsRuntime]',
+    '$xml = New-Object Windows.Data.Xml.Dom.XmlDocument',
+    `$xml.LoadXml('<toast><visual><binding template="ToastGeneric"><text>${escXml(title)}</text><text>${escXml(message)}</text></binding></visual></toast>')`,
+    '$toast = New-Object Windows.UI.Notifications.ToastNotification $xml',
+    `[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('${APP_ID}').Show($toast)`,
+  ].join('\n');
+
+  // Use -EncodedCommand (base64 UTF-16LE) to avoid Windows CreateProcess
+  // command-line quoting mangling the double-quotes inside the XML template.
+  // Available since PowerShell 2.0 (Windows 7+).
+  const encoded = Buffer.from(ps, 'utf16le').toString('base64');
+
+  let child;
+  try {
+    child = spawn('powershell', ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], { stdio: 'ignore' });
+  } catch (err) {
+    console.error('[opencode-notify] Failed to spawn powershell for toast notification:', err);
+    return Promise.resolve(null);
+  }
+  child.on('error', (err) => {
+    console.error('[opencode-notify] powershell toast error:', err);
+  });
+  child.unref();
+
+  return Promise.resolve({ platform: 'other', groupId: null });
 }
 
 /**
@@ -353,8 +417,7 @@ function subscribeLinuxActionInvoked(id, onClickCommand) {
  * Programmatically dismisses a previously sent notification.
  *
  * - Linux:  calls `gdbus … CloseNotification <id>` (fire-and-forget).
- * - macOS:  calls `notifier.notify({ remove: groupId })` which passes
- *           `-close <groupId>` to `terminal-notifier`.
+ * - macOS:  spawns `terminal-notifier -remove <groupId>`.
  * - Other:  no-op (no reliable mechanism).
  *
  * Passing `null` or `undefined` is always a safe no-op.
@@ -388,11 +451,18 @@ function closeDesktopNotification(handle) {
   }
 
   if (handle.platform === 'darwin') {
+    const args = ['-remove', handle.groupId];
+    let child;
     try {
-      notifier.notify({ remove: handle.groupId });
+      child = spawn('terminal-notifier', args, { stdio: 'ignore' });
     } catch (err) {
-      console.error('[opencode-notify] closeDesktopNotification (macOS) failed:', err);
+      console.error('[opencode-notify] closeDesktopNotification (macOS) failed to spawn terminal-notifier:', err);
+      return;
     }
+    child.on('error', (err) => {
+      console.error('[opencode-notify] terminal-notifier -remove error:', err);
+    });
+    child.unref();
     return;
   }
 

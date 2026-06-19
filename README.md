@@ -14,6 +14,14 @@ ln -s opencode-notify/src/index.js opencode-notify.js
 
 opencode will then automatically load the plugin on startup.
 
+### macOS prerequisite
+
+The plugin sends notifications on macOS by spawning [`terminal-notifier`](https://github.com/julienXX/terminal-notifier) directly. Install it once via Homebrew:
+
+```bash
+brew install terminal-notifier
+```
+
 To configure options, create `~/.config/opencode/opencode-notify.json`:
 
 ```json
