@@ -8,16 +8,35 @@
  *   - encounters a session error (`session.error`)
  *   - poses a question to the user (`question.asked`)
  *
+ * When a permission request is replied to (`permission.replied`) the
+ * corresponding notification is programmatically dismissed.
+ *
  * Session titles are cached on `session.created` / `session.updated` so that
  * event handlers never need an async API call.
  *
- * On Linux, notifications include a "Focus opencode" action button powered by
- * `notify-send --wait`.  Clicking the action runs `resolved.onClickCommand`
- * (if set) with `${NODE_PID}` substituted by the actual Node.js process PID.
+ * ## Notification back-ends
+ *
+ * ### Linux
+ * Uses `gdbus call … org.freedesktop.Notifications.Notify` directly (no
+ * dependency on `notify-send`).  The call returns the numeric notification ID
+ * synchronously, which is used later to dismiss the notification via
+ * `org.freedesktop.Notifications.CloseNotification`.  Action-button clicks
+ * ("Focus opencode") are detected by subscribing to the `ActionInvoked` D-Bus
+ * signal with a short-lived `gdbus monitor` process.
+ *
+ * ### macOS
+ * Uses `node-notifier` → `terminal-notifier`.  A caller-supplied `groupId`
+ * string is passed as `-group <groupId>` and later used to dismiss via
+ * `notifier.notify({ remove: groupId })`.
+ *
+ * ### Windows / other
+ * Uses `node-notifier`.  Dismiss is a no-op (no reliable cross-platform
+ * mechanism exists).
  */
 
 import { readFile } from 'node:fs/promises';
 import { spawn, exec } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import notifier from 'node-notifier';
@@ -86,18 +105,108 @@ function resolveSessionTitle(sessionTitleCache, sessionID) {
   return sessionTitleCache.get(sessionID) ?? `Session ${sessionID.slice(0, 8)}`;
 }
 
+// ---------------------------------------------------------------------------
+// Opaque notification handle
+// ---------------------------------------------------------------------------
+
+/**
+ * An opaque handle returned by `sendDesktopNotification` and consumed by
+ * `closeDesktopNotification`.  Callers must not inspect the shape — it is
+ * platform-specific.
+ *
+ * - Linux:          `{ platform: 'linux',   id: number }`
+ * - macOS / other:  `{ platform: 'darwin',  groupId: string }`
+ *                   `{ platform: 'other',   groupId: string }`
+ *
+ * @typedef {{ platform: 'linux'; id: number }
+ *           | { platform: 'darwin'; groupId: string }
+ *           | { platform: 'other'; groupId: string }} NotificationHandle
+ */
+
+// ---------------------------------------------------------------------------
+// D-Bus constants (Linux)
+// ---------------------------------------------------------------------------
+
+const DBUS_DEST    = 'org.freedesktop.Notifications';
+const DBUS_PATH    = '/org/freedesktop/Notifications';
+const DBUS_IFACE   = 'org.freedesktop.Notifications';
+
+// ---------------------------------------------------------------------------
+// sendDesktopNotification
+// ---------------------------------------------------------------------------
+
 /**
  * Sends a desktop notification, swallowing any errors to stderr so the plugin
  * never crashes opencode.
  *
- * On Linux, uses `notify-send --wait` with a "Focus opencode" action button so
- * the user can click back into opencode.  Stdout is read asynchronously; if
- * the action key `'default'` is received and `onClickCommand` is a non-empty
- * string, the command is executed via `child_process.exec` (fire-and-forget).
- * The function itself remains **synchronous** — all subprocess handling happens
- * in callbacks without blocking the caller.
+ * Returns a `Promise<NotificationHandle | null>` so that callers that need to
+ * dismiss the notification later can obtain the opaque handle.  Fire-and-forget
+ * callers may ignore the return value — the Promise never rejects.
  *
- * On non-Linux platforms the existing `node-notifier` path is used unchanged.
+ * ### Linux
+ * Sends via `gdbus call … Notify` (no dependency on `notify-send`).  The
+ * numeric notification ID is returned by the D-Bus call and resolves the
+ * Promise immediately.  A separate short-lived `gdbus monitor` process listens
+ * for the `ActionInvoked` signal so the "Focus opencode" action button still
+ * works.
+ *
+ * ### macOS
+ * Uses `node-notifier` with `-group <groupId>` so the notification can later
+ * be dismissed by group.  If no `groupId` is supplied a random UUID is used.
+ *
+ * ### Windows / other
+ * Uses `node-notifier`.  The handle is returned for API consistency but
+ * `closeDesktopNotification` is a no-op on these platforms.
+ *
+ * @param {{
+ *   title: string;
+ *   message: string;
+ *   urgency?: string;
+ *   groupId?: string;
+ *   onClickCommand?: string;
+ * }} opts
+ * @returns {Promise<NotificationHandle | null>}
+ */
+function sendDesktopNotification({ title, message, urgency, groupId, onClickCommand }) {
+  if (process.platform === 'linux') {
+    return sendDesktopNotificationLinux({ title, message, urgency, onClickCommand });
+  }
+
+  // macOS / Windows / other — node-notifier path
+  const resolvedGroupId = groupId ?? randomUUID();
+  try {
+    // node-notifier's mapToMac passes `group` as -group <id> to terminal-notifier
+    // on macOS; on other platforms it is a no-op extra property.
+    notifier.notify({
+      title,
+      message,
+      icon: ICON_PATH,
+      appID: APP_ID,   // Windows only; silently ignored on other platforms
+      group: resolvedGroupId,
+    });
+  } catch (err) {
+    console.error('[opencode-notify] Desktop notification failed:', err);
+    return Promise.resolve(null);
+  }
+
+  const platform = process.platform === 'darwin' ? 'darwin' : 'other';
+  return Promise.resolve({ platform, groupId: resolvedGroupId });
+}
+
+/**
+ * Linux implementation of `sendDesktopNotification`.
+ * Uses `gdbus call … org.freedesktop.Notifications.Notify` directly so that
+ * no dependency on `notify-send` is required.
+ *
+ * The D-Bus `Notify` method signature:
+ *   Notify(app_name, replaces_id, app_icon, summary, body,
+ *          actions[], hints{sv}, expire_timeout) → uint id
+ *
+ * Actions are an interleaved array of [key, label, …]; we use the conventional
+ * `'default'` key for the primary "Focus opencode" action.
+ *
+ * Urgency is passed as a D-Bus hint: `{'urgency': <byte N>}` where
+ *   0 = low, 1 = normal, 2 = critical.
  *
  * @param {{
  *   title: string;
@@ -105,79 +214,189 @@ function resolveSessionTitle(sessionTitleCache, sessionID) {
  *   urgency?: string;
  *   onClickCommand?: string;
  * }} opts
+ * @returns {Promise<NotificationHandle | null>}
  */
-function sendDesktopNotification({ title, message, urgency, onClickCommand }) {
-  if (process.platform === 'linux') {
-    // Build notify-send argument list
-    const args = ['--wait', '-A', 'default=Focus opencode', '--icon', ICON_PATH];
-    if (urgency) {
-      args.push(`--urgency=${urgency}`);
-    }
-    args.push('--', title, message);
+function sendDesktopNotificationLinux({ title, message, urgency, onClickCommand }) {
+  // Map string urgency name → D-Bus byte value
+  const urgencyByte = urgency === 'critical' ? 2 : urgency === 'low' ? 0 : 1;
+  const hintsArg = `{'urgency': <byte ${urgencyByte}>}`;
 
+  // expire_timeout: 0 = notification server decides (never expires for critical)
+  const args = [
+    'call', '--session',
+    '--dest', DBUS_DEST,
+    '--object-path', DBUS_PATH,
+    '--method', `${DBUS_IFACE}.Notify`,
+    'opencode',               // app_name
+    '0',                      // replaces_id (0 = new notification)
+    ICON_PATH,                // app_icon
+    title,                    // summary
+    message,                  // body
+    "['default', 'Focus opencode']", // actions
+    hintsArg,                 // hints
+    '0',                      // expire_timeout
+  ];
+
+  return new Promise((resolve) => {
     let child;
     try {
-      child = spawn('notify-send', args, {
-        detached: true,
-        stdio: ['ignore', 'pipe', 'ignore'],
+      child = spawn('gdbus', args, {
+        stdio: ['ignore', 'pipe', 'pipe'],
       });
     } catch (err) {
-      console.error('[opencode-notify] Desktop notification failed:', err);
+      console.error('[opencode-notify] Failed to spawn gdbus:', err);
+      resolve(null);
       return;
     }
 
     child.on('error', (err) => {
-      console.error('[opencode-notify] Failed to spawn notify-send:', err);
+      console.error('[opencode-notify] gdbus Notify failed:', err);
+      resolve(null);
     });
 
-    // Read stdout line-by-line to detect the action key
-    let buffer = '';
+    let stdout = '';
     child.stdout.setEncoding('utf8');
-    child.stdout.on('data', (chunk) => {
-      buffer += chunk;
-      const lines = buffer.split('\n');
-      // Keep the last (possibly incomplete) fragment
-      buffer = lines.pop() ?? '';
-      for (const line of lines) {
-        // 'default' is the action key we passed to -A (default=Focus opencode)
-        if (line === 'default' && onClickCommand) {
-          const cmd = onClickCommand.replaceAll('${NODE_PID}', String(process.pid));
-          exec(cmd, (err) => {
-            if (err) {
-              console.error('[opencode-notify] onClickCommand failed:', err);
-            }
-          });
-        }
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+
+    child.stdout.on('close', () => {
+      // D-Bus Notify returns "(uint32 NNN,)"
+      const match = stdout.match(/\(uint32 (\d+),\)/);
+      if (!match) {
+        console.error('[opencode-notify] gdbus Notify returned unexpected output:', stdout.trim());
+        resolve(null);
+        return;
+      }
+      const id = Number(match[1]);
+      resolve({ platform: 'linux', id });
+
+      // Fire-and-forget: subscribe to ActionInvoked so the "Focus opencode"
+      // button still works.  The monitor process exits on its own once the
+      // notification is dismissed or times out.
+      if (onClickCommand) {
+        subscribeLinuxActionInvoked(id, onClickCommand);
       }
     });
 
-    child.stdout.on('error', (err) => {
-      console.error('[opencode-notify] notify-send stdout error:', err);
+    child.stderr.on('data', (chunk) => {
+      console.error('[opencode-notify] gdbus Notify stderr:', chunk.toString().trim());
     });
+  });
+}
 
-    child.stdout.on('close', () => {
-      // Flush any unterminated final line
-      if (buffer === 'default' && onClickCommand) {
+/**
+ * Spawns a `gdbus monitor` process that listens for the `ActionInvoked` signal
+ * on the given notification `id`.  When the `'default'` action key is received,
+ * `onClickCommand` is executed (fire-and-forget).  The monitor exits naturally
+ * once the notification is closed.
+ *
+ * @param {number} id             Numeric notification ID returned by Notify.
+ * @param {string} onClickCommand Shell command to execute; `${NODE_PID}` is
+ *                                substituted with `process.pid`.
+ */
+function subscribeLinuxActionInvoked(id, onClickCommand) {
+  let monitor;
+  try {
+    monitor = spawn('gdbus', [
+      'monitor', '--session',
+      '--dest', DBUS_DEST,
+      '--object-path', DBUS_PATH,
+    ], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  } catch (err) {
+    console.error('[opencode-notify] Failed to spawn gdbus monitor:', err);
+    return;
+  }
+
+  monitor.on('error', (err) => {
+    console.error('[opencode-notify] gdbus monitor error:', err);
+  });
+
+  let buffer = '';
+  monitor.stdout.setEncoding('utf8');
+  monitor.stdout.on('data', (chunk) => {
+    buffer += chunk;
+    const lines = buffer.split('\n');
+    buffer = lines.pop() ?? '';
+    for (const line of lines) {
+      // ActionInvoked line format:
+      //   /org/…: org.freedesktop.Notifications.ActionInvoked (uint32 NNN, 'key')
+      const actionMatch = line.match(/ActionInvoked \(uint32 (\d+), '([^']+)'\)/);
+      if (actionMatch && Number(actionMatch[1]) === id && actionMatch[2] === 'default') {
         const cmd = onClickCommand.replaceAll('${NODE_PID}', String(process.pid));
         exec(cmd, (err) => {
           if (err) console.error('[opencode-notify] onClickCommand failed:', err);
         });
+        monitor.kill();
+        return;
       }
-      child.unref();
-    });
-  } else {
-    // Non-Linux: use node-notifier (unchanged behaviour)
-    try {
-      notifier.notify({
-        title,
-        message,
-        icon: ICON_PATH,
-        appID: APP_ID, // Windows only; silently ignored on other platforms
-      });
-    } catch (err) {
-      console.error('[opencode-notify] Desktop notification failed:', err);
+
+      // NotificationClosed: no more events for this ID — clean up
+      const closedMatch = line.match(/NotificationClosed \(uint32 (\d+), uint32 \d+\)/);
+      if (closedMatch && Number(closedMatch[1]) === id) {
+        monitor.kill();
+        return;
+      }
     }
+  });
+
+  monitor.on('close', () => {
+    monitor.unref();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// closeDesktopNotification
+// ---------------------------------------------------------------------------
+
+/**
+ * Programmatically dismisses a previously sent notification.
+ *
+ * - Linux:  calls `gdbus … CloseNotification <id>` (fire-and-forget).
+ * - macOS:  calls `notifier.notify({ remove: groupId })` which passes
+ *           `-close <groupId>` to `terminal-notifier`.
+ * - Other:  no-op (no reliable mechanism).
+ *
+ * Passing `null` or `undefined` is always a safe no-op.
+ *
+ * @param {NotificationHandle | null | undefined} handle
+ * @returns {void}
+ */
+function closeDesktopNotification(handle) {
+  if (!handle) return;
+
+  if (handle.platform === 'linux') {
+    const args = [
+      'call', '--session',
+      '--dest', DBUS_DEST,
+      '--object-path', DBUS_PATH,
+      '--method', `${DBUS_IFACE}.CloseNotification`,
+      String(handle.id),
+    ];
+    let child;
+    try {
+      child = spawn('gdbus', args, { stdio: 'ignore' });
+    } catch (err) {
+      console.error('[opencode-notify] closeDesktopNotification failed to spawn gdbus:', err);
+      return;
+    }
+    child.on('error', (err) => {
+      console.error('[opencode-notify] gdbus CloseNotification error:', err);
+    });
+    child.unref();
+    return;
   }
+
+  if (handle.platform === 'darwin') {
+    try {
+      notifier.notify({ remove: handle.groupId });
+    } catch (err) {
+      console.error('[opencode-notify] closeDesktopNotification (macOS) failed:', err);
+    }
+    return;
+  }
+
+  // 'other' (Windows, etc.) — no reliable dismiss mechanism
 }
 
 /**
@@ -378,6 +597,16 @@ export default async function opencodeNotify(_input, options = {}) {
    */
   const todoStateCache = new Map();
 
+  /**
+   * Cache of permission requestID → NotificationHandle.
+   * Populated when a `permission.asked` notification is sent; consumed (and
+   * deleted) when the corresponding `permission.replied` event fires so the
+   * in-flight notification can be dismissed.
+   *
+   * @type {Map<string, NotificationHandle>}
+   */
+  const permissionNotifHandleCache = new Map();
+
   return {
     /**
      * Handles all opencode events.  Unrecognised event types are silently
@@ -402,18 +631,30 @@ export default async function opencodeNotify(_input, options = {}) {
         // -----------------------------------------------------------------
         case 'permission.asked': {
           const permission = event.properties;
-          const { sessionID } = permission;
+          const { id: requestID, sessionID } = permission;
           const sessionTitle = resolveSessionTitle(sessionTitleCache, sessionID);
 
           if (desktopEnabled) {
             // permission requests always notify regardless of focus — the terminal
-            // is almost always focused when a permission fires
-            sendDesktopNotification({
+            // is almost always focused when a permission fires.
+            // Await the handle so we can dismiss the notification on permission.replied.
+            // If a duplicate permission.asked arrives for the same requestID,
+            // close the previous notification first.
+            if (permissionNotifHandleCache.has(requestID)) {
+              closeDesktopNotification(permissionNotifHandleCache.get(requestID));
+              permissionNotifHandleCache.delete(requestID);
+            }
+
+            const handle = await sendDesktopNotification({
               title: 'opencode \u2013 Permission Request',
               message: `${permission.permission}\n${sessionTitle}`,
               urgency: 'critical',
+              groupId: requestID,
               onClickCommand,
             });
+            if (handle !== null) {
+              permissionNotifHandleCache.set(requestID, handle);
+            }
           }
 
           if (webhooks.length > 0) {
@@ -424,6 +665,16 @@ export default async function opencodeNotify(_input, options = {}) {
               permissionTitle: permission.permission,
             });
           }
+          break;
+        }
+
+        // -----------------------------------------------------------------
+        // Permission replied — dismiss the in-flight notification
+        // -----------------------------------------------------------------
+        case 'permission.replied': {
+          const { requestID } = event.properties;
+          closeDesktopNotification(permissionNotifHandleCache.get(requestID));
+          permissionNotifHandleCache.delete(requestID);
           break;
         }
 

@@ -59,11 +59,10 @@ To disable focus detection and always notify: set `skipIfFocused: false`.
 
 ## Click to Focus (Linux)
 
-On Linux, every desktop notification includes a **"Focus opencode"** action button rendered by `notify-send --wait`.
+On Linux, every desktop notification includes a **"Focus opencode"** action button.
+Notifications are sent via `gdbus call … org.freedesktop.Notifications.Notify` directly — no dependency on `notify-send`. `gdbus` is part of GLib (`glib2` / `libglib2.0-bin`), which is present on virtually every Linux desktop.
 
-> **Requires** `notify-send` to be installed (`libnotify-bin` on Debian/Ubuntu, `libnotify` on Arch).
-
-- **Permission notifications** use `--urgency=critical`, which may cause your compositor to raise the opencode window automatically.
+- **Permission notifications** use `urgency=critical`, which may cause your compositor to raise the opencode window automatically. When the user approves or rejects the request, the notification is automatically dismissed.
 - **Todo notifications** use default urgency.
 - If `onClickCommand` is set and non-empty, it is executed via `child_process.exec` when the user clicks the action. If `onClickCommand` is absent or empty the click is a no-op (the action button is still shown but does nothing beyond dismissing the notification).
 
@@ -113,6 +112,7 @@ The plugin POSTs a JSON body to each configured webhook URL. Five event shapes a
 The plugin handles the following opencode events:
 
 - **`permission.asked`** — fired when opencode raises a permission request that requires user approval. Triggers a `permission_request` notification. Focus suppression is always bypassed so permission requests always reach the user.
+- **`permission.replied`** — fired when a permission request is answered (approved or rejected). The corresponding `permission_request` notification is programmatically dismissed.
 - **`todo.updated`** — fired when a todo transitions to `completed`. Triggers a `todo_completed` notification.
 - **`session.idle`** — fired when a session finishes and the agent becomes idle. Triggers a `session_idle` notification ("Task Done").
 - **`session.error`** — fired when a session encounters an error. Triggers a `session_error` notification ("Session Error").
