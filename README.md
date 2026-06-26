@@ -45,6 +45,28 @@ The file is optional — omitting it uses the defaults listed in [Options](#opti
 | `skipIfFocused` | `boolean` | `true` | Suppress desktop notifications when the opencode window is already focused. See [Focus Detection](#focus-detection) for platform caveats. |
 | `webhooks` | `WebhookTarget[]` | `[]` | List of webhook targets to POST to |
 | `onClickCommand` | `string` | — | Shell command to run when the user clicks the "Focus opencode" action (Linux only). The literal string `${NODE_PID}` is replaced at runtime with the plugin's Node.js process PID. |
+| `notifications` | `object` | `{}` | Per-event notification toggles. All keys default to `true`; set a key to `false` to disable that event for **both** desktop and webhook channels. |
+
+### Per-event toggles (`notifications` object)
+
+| Key | Opencode event | Default | Description |
+|-----|----------------|---------|-------------|
+| `taskFinished` | `session.idle` | `true` | "Task Done" — fired when a session becomes idle |
+| `questionAsked` | `question.asked` | `true` | Question prompt — fired when opencode asks the user a question |
+| `permissionRequested` | `permission.asked` | `true` | Permission request — fired when opencode needs user approval |
+| `todoCompleted` | `todo.updated` | `true` | Todo done — fired when an individual todo transitions to `completed` |
+| `sessionError` | `session.error` | `true` | Session error — fired when a session encounters an error |
+
+**Example** — disable "Task Done" and todo notifications:
+
+```json
+{
+  "notifications": {
+    "taskFinished": false,
+    "todoCompleted": false
+  }
+}
+```
 
 ## Focus Detection
 
@@ -119,11 +141,11 @@ The plugin POSTs a JSON body to each configured webhook URL. Five event shapes a
 
 ## Events
 
-The plugin handles the following opencode events:
+The plugin handles the following opencode events. Each notifying event can be individually disabled via the [`notifications` option](#per-event-toggles-notifications-object).
 
-- **`permission.asked`** — fired when opencode raises a permission request that requires user approval. Triggers a `permission_request` notification. Focus suppression is always bypassed so permission requests always reach the user.
+- **`permission.asked`** — fired when opencode raises a permission request that requires user approval. Triggers a `permission_request` notification. Focus suppression is always bypassed so permission requests always reach the user. Disable with `notifications.permissionRequested: false`.
 - **`permission.replied`** — fired when a permission request is answered (approved or rejected). The corresponding `permission_request` notification is programmatically dismissed.
-- **`todo.updated`** — fired when a todo transitions to `completed`. Triggers a `todo_completed` notification.
-- **`session.idle`** — fired when a session finishes and the agent becomes idle. Triggers a `session_idle` notification ("Task Done").
-- **`session.error`** — fired when a session encounters an error. Triggers a `session_error` notification ("Session Error").
-- **`question.asked`** — fired when opencode asks the user a question. Triggers a `question_asked` notification. Focus suppression is **always bypassed** for this event so questions always reach the user.
+- **`todo.updated`** — fired when a todo transitions to `completed`. Triggers a `todo_completed` notification. Disable with `notifications.todoCompleted: false`.
+- **`session.idle`** — fired when a session finishes and the agent becomes idle. Triggers a `session_idle` notification ("Task Done"). Disable with `notifications.taskFinished: false`.
+- **`session.error`** — fired when a session encounters an error. Triggers a `session_error` notification ("Session Error"). Disable with `notifications.sessionError: false`.
+- **`question.asked`** — fired when opencode asks the user a question. Triggers a `question_asked` notification. Focus suppression is **always bypassed** for this event so questions always reach the user. Disable with `notifications.questionAsked: false`.

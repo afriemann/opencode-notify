@@ -706,6 +706,25 @@ export default async function opencodeNotify(_input, options = {}) {
   const onClickCommand = resolved.onClickCommand;
 
   /**
+   * Per-event notification toggles.  Each key defaults to `true`; set to
+   * `false` in the config file (or inline options) to silence that event
+   * for both desktop and webhook channels.
+   *
+   * Supported keys (all under a `notifications` object):
+   *   - `taskFinished`         → session.idle
+   *   - `questionAsked`        → question.asked
+   *   - `permissionRequested`  → permission.asked
+   *   - `todoCompleted`        → todo.updated
+   *   - `sessionError`         → session.error
+   */
+  const notifCfg = resolved.notifications ?? {};
+  const notifyTaskFinished        = notifCfg.taskFinished        ?? true;
+  const notifyQuestionAsked       = notifCfg.questionAsked       ?? true;
+  const notifyPermissionRequested = notifCfg.permissionRequested ?? true;
+  const notifyTodoCompleted       = notifCfg.todoCompleted       ?? true;
+  const notifySessionError        = notifCfg.sessionError        ?? true;
+
+  /**
    * Cache of sessionID → session title.
    * Populated by `session.created` and `session.updated`; consumed by
    * `permission.asked` and `todo.updated`.
@@ -757,6 +776,8 @@ export default async function opencodeNotify(_input, options = {}) {
         // Permission request
         // -----------------------------------------------------------------
         case 'permission.asked': {
+          if (!notifyPermissionRequested) break;
+
           const permission = event.properties;
           const { id: requestID, sessionID } = permission;
           const sessionTitle = resolveSessionTitle(sessionTitleCache, sessionID);
@@ -809,6 +830,8 @@ export default async function opencodeNotify(_input, options = {}) {
         // Todo completed
         // -----------------------------------------------------------------
         case 'todo.updated': {
+          if (!notifyTodoCompleted) break;
+
           const { sessionID, todos } = event.properties;
           const sessionTitle = resolveSessionTitle(sessionTitleCache, sessionID);
 
@@ -862,6 +885,8 @@ export default async function opencodeNotify(_input, options = {}) {
         // Session idle (task finished)
         // -----------------------------------------------------------------
         case 'session.idle': {
+          if (!notifyTaskFinished) break;
+
           const { sessionID } = event.properties;
           const sessionTitle = resolveSessionTitle(sessionTitleCache, sessionID);
 
@@ -891,6 +916,8 @@ export default async function opencodeNotify(_input, options = {}) {
         // Session error
         // -----------------------------------------------------------------
         case 'session.error': {
+          if (!notifySessionError) break;
+
           const { sessionID = 'unknown' } = event.properties;
           const sessionTitle = resolveSessionTitle(sessionTitleCache, sessionID);
 
@@ -921,6 +948,8 @@ export default async function opencodeNotify(_input, options = {}) {
         // Question asked
         // -----------------------------------------------------------------
         case 'question.asked': {
+          if (!notifyQuestionAsked) break;
+
           const { sessionID, questions = [] } = event.properties;
           const sessionTitle = resolveSessionTitle(sessionTitleCache, sessionID);
           const notifTitle = questions[0]?.header
