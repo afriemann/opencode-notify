@@ -650,9 +650,6 @@ async function isOpencodeWindowFocused() {
     }
 
     if (windowOwnerPid == null) {
-      console.error(
-        '[opencode-notify] Could not detect active window; sending notification anyway',
-      );
       return false;
     }
 
@@ -669,10 +666,7 @@ async function isOpencodeWindowFocused() {
       // direct parent (the terminal emulator that spawned it).
       return windowOwnerPid === process.pid || windowOwnerPid === process.ppid;
     }
-  } catch (err) {
-    console.error(
-      `[opencode-notify] Window focus detection failed: ${err.message}; sending notification anyway`,
-    );
+  } catch {
     return false;
   }
 }
