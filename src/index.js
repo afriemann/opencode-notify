@@ -747,6 +747,16 @@ export default async function opencodeNotify(_input, options = {}) {
    */
   const permissionNotifHandleCache = new Map();
 
+  /**
+   * Cache of question requestID → NotificationHandle.
+   * Populated when a `question.asked` notification is sent; consumed (and
+   * deleted) when the corresponding `question.replied` or `question.rejected`
+   * event fires so the in-flight notification can be dismissed.
+   *
+   * @type {Map<string, NotificationHandle>}
+   */
+  const questionNotifHandleCache = new Map();
+
   return {
     /**
      * Handles all opencode events.  Unrecognised event types are silently
@@ -944,7 +954,7 @@ export default async function opencodeNotify(_input, options = {}) {
         case 'question.asked': {
           if (!notifyQuestionAsked) break;
 
-          const { sessionID, questions = [] } = event.properties;
+          const { id: requestID, sessionID, questions = [] } = event.properties;
           const sessionTitle = resolveSessionTitle(sessionTitleCache, sessionID);
           const notifTitle = questions[0]?.header
             ? `opencode \u2013 ${questions[0].header}`
@@ -952,12 +962,23 @@ export default async function opencodeNotify(_input, options = {}) {
           const notifMessage = questions[0]?.question ?? sessionTitle;
 
           if (desktopEnabled) {
-            // questions must always reach the user regardless of focus state
-            sendDesktopNotification({
+            // questions must always reach the user regardless of focus state.
+            // Await the handle so we can dismiss the notification on question.replied
+            // or question.rejected. If a duplicate question.asked arrives for the
+            // same requestID, close the previous notification first.
+            if (questionNotifHandleCache.has(requestID)) {
+              closeDesktopNotification(questionNotifHandleCache.get(requestID));
+              questionNotifHandleCache.delete(requestID);
+            }
+
+            const handle = await sendDesktopNotification({
               title: notifTitle,
               message: notifMessage,
               onClickCommand,
             });
+            if (handle !== null) {
+              questionNotifHandleCache.set(requestID, handle);
+            }
           }
 
           if (webhooks.length > 0) {
@@ -969,6 +990,17 @@ export default async function opencodeNotify(_input, options = {}) {
               questionBody: questions[0]?.question,
             });
           }
+          break;
+        }
+
+        // -----------------------------------------------------------------
+        // Question replied / rejected — dismiss the in-flight notification
+        // -----------------------------------------------------------------
+        case 'question.replied':
+        case 'question.rejected': {
+          const { requestID } = event.properties;
+          closeDesktopNotification(questionNotifHandleCache.get(requestID));
+          questionNotifHandleCache.delete(requestID);
           break;
         }
 
