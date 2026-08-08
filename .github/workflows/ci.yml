@@ -27,7 +27,7 @@ jobs:
         node-version: ["20", "22"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@v4 # pinned SHA — Dependabot will update
+      - uses: actions/setup-node@v7 # pinned SHA — Dependabot will update
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
