@@ -1,0 +1,16 @@
+version: 2
+updates:
+  # Keep GitHub Actions pinned to current SHAs automatically.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  # Keep npm dependencies up to date.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
