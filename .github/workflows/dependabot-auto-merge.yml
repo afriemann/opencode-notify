@@ -1,0 +1,70 @@
+name: Dependabot auto-merge
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+# workflow_run runs in the base-branch (main) context, so GITHUB_TOKEN carries
+# write access to merge PRs regardless of whether the source is a fork or bot.
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    name: Merge Dependabot PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Guard: CI must have succeeded for a Dependabot-authored branch.
+    # The if-check is at the job level so the job is entirely skipped (not just
+    # the steps) for non-Dependabot or failed workflow runs.
+    if: >-
+      github.event.workflow_run.actor.login == 'dependabot[bot]' &&
+      github.event.workflow_run.conclusion == 'success'
+    steps:
+      - name: Find and merge Dependabot PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          # Look up the open PR for the branch Dependabot ran CI on.
+          PR_NUMBER=$(gh pr list \
+            --repo "$REPO" \
+            --head "$HEAD_BRANCH" \
+            --author "dependabot[bot]" \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')
+
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No open Dependabot PR for branch '$HEAD_BRANCH' — skipping."
+            exit 0
+          fi
+
+          PR_TITLE=$(gh pr view "$PR_NUMBER" \
+            --repo "$REPO" \
+            --json title \
+            --jq '.title')
+
+          echo "PR #$PR_NUMBER: $PR_TITLE"
+
+          # For standard "Bump X from A.B.C to D.E.F" titles, skip when the
+          # leading (major) version component changes — warrants a manual review.
+          OLD_MAJOR=$(echo "$PR_TITLE" | grep -oP 'from \K\d+(?=\.)' | head -1)
+          NEW_MAJOR=$(echo "$PR_TITLE" | grep -oP ' to \K\d+(?=\.)' | head -1)
+
+          if [ -n "$OLD_MAJOR" ] && [ -n "$NEW_MAJOR" ] && [ "$OLD_MAJOR" != "$NEW_MAJOR" ]; then
+            echo "Major version bump ($OLD_MAJOR → $NEW_MAJOR) — skipping (manual review recommended)."
+            exit 0
+          fi
+
+          # Approve the PR. github-actions[bot] is a different identity from
+          # dependabot[bot], so this approval is allowed.
+          echo "Approving PR #$PR_NUMBER"
+          gh pr review "$PR_NUMBER" --approve --repo "$REPO"
+
+          # Squash-merge for a clean commit history on dependency bumps.
+          echo "Merging PR #$PR_NUMBER"
+          gh pr merge "$PR_NUMBER" --squash --repo "$REPO"
