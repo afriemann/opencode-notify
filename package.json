@@ -16,12 +16,8 @@
   "peerDependencies": {
     "@opencode-ai/plugin": ">=1.15.0"
   },
-  "dependencies": {
-    "get-windows": "^9.3.0"
-  },
   "license": "MIT",
   "allowScripts": {
-    "get-windows@9.3.0": true,
     "msgpackr-extract@3.0.4": true
   },
   "devDependencies": {
