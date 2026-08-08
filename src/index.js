@@ -529,6 +529,53 @@ async function collectLinuxAncestorPids(startPid) {
 }
 
 /**
+ * Returns the PID of the currently focused window on X11 / XWayland by
+ * querying two standard X11 properties via `xprop`:
+ *
+ *   1. `xprop -root _NET_ACTIVE_WINDOW` — reads the active window ID from the
+ *      root window.
+ *   2. `xprop -id <id> _NET_WM_PID` — reads the owner PID for that window.
+ *
+ * Returns `null` if `xprop` is unavailable, no window is active, or the
+ * focused window does not advertise `_NET_WM_PID`.
+ *
+ * @returns {Promise<number | null>}
+ */
+async function getXpropActiveWindowPid() {
+  const windowId = await new Promise((resolve) => {
+    const child = spawn('xprop', ['-root', '_NET_ACTIVE_WINDOW'], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    let output = '';
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => { output += chunk; });
+    child.on('error', () => resolve(null));
+    child.on('close', (code) => {
+      if (code !== 0) return resolve(null);
+      const match = output.match(/0x[0-9a-fA-F]+/);
+      resolve(match ? match[0] : null);
+    });
+  });
+
+  if (!windowId) return null;
+
+  return new Promise((resolve) => {
+    const child = spawn('xprop', ['-id', windowId, '_NET_WM_PID'], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    let output = '';
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => { output += chunk; });
+    child.on('error', () => resolve(null));
+    child.on('close', (code) => {
+      if (code !== 0) return resolve(null);
+      const match = output.match(/\d+/);
+      resolve(match ? parseInt(match[0], 10) : null);
+    });
+  });
+}
+
+/**
  * Returns the PID of the currently focused window via Hyprland's IPC, or
  * `null` if Hyprland is not running, `hyprctl` is unavailable, or the call
  * fails for any reason.
@@ -610,7 +657,7 @@ async function getSwaymsgActiveWindowPid() {
  * already looking at the opencode window), and `false` otherwise.
  *
  * Strategy (Linux):
- *   1. Obtain the focused window's owner PID via get-windows (X11 / XWayland),
+ *   1. Obtain the focused window's owner PID via xprop (X11 / XWayland),
  *      Hyprland IPC, or Sway IPC — whichever is available.
  *   2. Walk `/proc` upward from `process.pid` to collect all ancestor PIDs
  *      (the chain: opencode → shell → terminal emulator → display server).
@@ -625,22 +672,18 @@ async function getSwaymsgActiveWindowPid() {
 async function isOpencodeWindowFocused() {
   try {
     // Wayland-only guard: if running native Wayland with no XWayland,
-    // get-windows won't work — try compositor IPC instead.
+    // xprop won't work — try compositor IPC instead.
     const nativeWayland = Boolean(process.env.WAYLAND_DISPLAY && !process.env.DISPLAY);
 
     let windowOwnerPid = null;
 
     if (!nativeWayland) {
-      // X11 or XWayland: get-windows queries the active window via Xlib/XCB.
-      const { activeWindow } = await import('get-windows');
-      const activeWindowResult = await activeWindow();
-      if (activeWindowResult != null) {
-        windowOwnerPid = activeWindowResult.owner.processId;
-      }
+      // X11 or XWayland: query _NET_ACTIVE_WINDOW → _NET_WM_PID via xprop.
+      windowOwnerPid = await getXpropActiveWindowPid();
     }
 
-    // Compositor IPC fallbacks — used when get-windows returns nothing
-    // (including on native Wayland where get-windows is skipped entirely).
+    // Compositor IPC fallbacks — used when xprop returns nothing
+    // (including on native Wayland where xprop is skipped entirely).
     if (windowOwnerPid == null && process.env.HYPRLAND_INSTANCE_SIGNATURE) {
       windowOwnerPid = await getHyprlandActiveWindowPid();
     }

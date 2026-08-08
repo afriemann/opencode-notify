@@ -74,7 +74,7 @@ When `skipIfFocused` is `true` (the default), the plugin suppresses desktop noti
 
 > **Note:** `permission.asked` and `question.asked` always bypass focus suppression — permission requests and questions are always delivered to the user regardless of the `skipIfFocused` setting.
 
-Focus is detected by obtaining the focused window's owner PID (via [`get-windows`](https://github.com/sindresorhus/get-windows) on X11/XWayland, or compositor IPC on native Wayland) and then walking `/proc` upward from the opencode Node process — checking whether the focused window's PID appears in opencode's ancestor chain (opencode → shell → terminal emulator → display server).
+Focus is detected by obtaining the focused window's owner PID (via `xprop` querying `_NET_ACTIVE_WINDOW` / `_NET_WM_PID` on X11/XWayland, or compositor IPC on native Wayland) and then walking `/proc` upward from the opencode Node process — checking whether the focused window's PID appears in opencode's ancestor chain (opencode → shell → terminal emulator → display server).
 
 | Platform | Support |
 |----------|---------|

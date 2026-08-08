@@ -8,23 +8,13 @@
     "src"
   ],
   "scripts": {
-    "test": "node --experimental-vm-modules node_modules/.bin/jest --passWithNoTests"
-  },
-  "jest": {
-    "testEnvironment": "node"
+    "test": "node --experimental-vm-modules node_modules/.bin/jest"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": ">=1.15.0"
   },
-  "dependencies": {
-    "get-windows": "^9.3.0"
-  },
   "license": "MIT",
   "allowScripts": {
-    "get-windows@9.3.0": true,
     "msgpackr-extract@3.0.4": true
-  },
-  "devDependencies": {
-    "jest": "^30.4.2"
   }
 }
