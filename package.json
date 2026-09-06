@@ -21,6 +21,6 @@
     "msgpackr-extract@3.0.4": true
   },
   "devDependencies": {
-    "jest": "^30.4.2"
+    "jest": "^30.5.1"
   }
 }
