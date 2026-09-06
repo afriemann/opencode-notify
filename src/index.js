@@ -67,23 +67,29 @@ const CONFIG_FILE_PATH = join(homedir(), '.config', 'opencode', 'opencode-notify
 
 /**
  * Reads and parses the optional per-user config file.  Returns a (possibly
- * empty) options object.  Any read or parse error is logged to stderr and
- * treated as "no config" so the plugin still starts with defaults.
+ * empty) options object.  Any read or parse error is logged via
+ * `client.app.log` and treated as "no config" so the plugin still starts
+ * with defaults.
  *
+ * @param {unknown} client
  * @returns {Promise<Record<string, unknown>>}
  */
-async function readConfigFile() {
+async function readConfigFile(client) {
   try {
     const raw = await readFile(CONFIG_FILE_PATH, 'utf8');
     const parsed = JSON.parse(raw);
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      console.error('[opencode-notify] Config file must be a JSON object; ignoring.');
+      logPluginError(client, 'warn', 'Config file must be a JSON object; ignoring.', {
+        path: CONFIG_FILE_PATH,
+      });
       return {};
     }
     return parsed;
   } catch (err) {
     if (err.code !== 'ENOENT') {
-      console.error(`[opencode-notify] Could not read config file (${CONFIG_FILE_PATH}):`, err.message);
+      logPluginError(client, 'error', `Could not read config file (${CONFIG_FILE_PATH}): ${err.message}`, {
+        path: CONFIG_FILE_PATH,
+      });
     }
     return {};
   }
@@ -103,6 +109,60 @@ async function readConfigFile() {
  */
 function resolveSessionTitle(sessionTitleCache, sessionID) {
   return sessionTitleCache.get(sessionID) ?? `Session ${sessionID.slice(0, 8)}`;
+}
+
+/**
+ * Routes a diagnostic message through opencode's structured logging endpoint
+ * (`client.app.log`) instead of `console.*`. The plugin runs inside opencode's
+ * own Node.js process, so any direct `console.*` write is rendered straight
+ * into the TUI's terminal buffer and corrupts it; `client.app.log` posts to
+ * opencode's internal log pipeline instead, which never touches the terminal.
+ *
+ * Fire-and-forget: never throws, never rejects visibly, and never falls back
+ * to `console.*` — a failure to log must not itself become a TUI-polluting
+ * error.
+ *
+ * @param {{ app?: { log?: (arg: unknown) => Promise<unknown> } } | undefined} client
+ * @param {'debug' | 'info' | 'warn' | 'error'} level
+ * @param {string} message
+ * @param {Record<string, unknown>} [extra]
+ * @returns {void}
+ */
+function logPluginError(client, level, message, extra) {
+  try {
+    client?.app?.log?.({
+      body: {
+        service: 'opencode-notify',
+        level,
+        message,
+        extra,
+      },
+    })?.catch?.(() => {});
+  } catch {
+    // Never throw — see doc comment above. A synchronous throw here would
+    // propagate out of `child.on('error', ...)` handlers as an uncaught
+    // exception, which is exactly the host-crashing failure mode this
+    // helper exists to prevent.
+  }
+}
+
+/**
+ * Returns `true` when no graphical/D-Bus session is detectable on Linux —
+ * i.e. `DISPLAY`, `WAYLAND_DISPLAY`, and `DBUS_SESSION_BUS_ADDRESS` are all
+ * unset. This is the common case for opencode running on a bare tty with no
+ * desktop environment, where `gdbus call --session ...` (and any other
+ * desktop-notification backend) has no daemon to talk to. Used to disable
+ * desktop notifications proactively, before ever attempting a spawn.
+ *
+ * @returns {boolean}
+ */
+function isDesktopEnvironmentUnavailable() {
+  return (
+    process.platform === 'linux' &&
+    !process.env.DISPLAY &&
+    !process.env.WAYLAND_DISPLAY &&
+    !process.env.DBUS_SESSION_BUS_ADDRESS
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -166,18 +226,24 @@ const DBUS_IFACE   = 'org.freedesktop.Notifications';
  *   groupId?: string;
  *   onClickCommand?: string;
  * }} opts
+ * @param {unknown} client
+ * @param {{ desktopUnavailable: boolean }} notificationState
  * @returns {Promise<NotificationHandle | null>}
  */
-function sendDesktopNotification({ title, message, urgency, groupId, onClickCommand }) {
+function sendDesktopNotification({ title, message, urgency, groupId, onClickCommand }, client, notificationState) {
+  if (notificationState.desktopUnavailable) {
+    return Promise.resolve(null);
+  }
+
   if (process.platform === 'linux') {
-    return sendDesktopNotificationLinux({ title, message, urgency, onClickCommand });
+    return sendDesktopNotificationLinux({ title, message, urgency, onClickCommand }, client, notificationState);
   }
 
   if (process.platform === 'darwin') {
-    return sendDesktopNotificationMac({ title, message, groupId });
+    return sendDesktopNotificationMac({ title, message, groupId }, client, notificationState);
   }
 
-  return sendDesktopNotificationWindows({ title, message });
+  return sendDesktopNotificationWindows({ title, message }, client, notificationState);
 }
 
 /**
@@ -185,9 +251,11 @@ function sendDesktopNotification({ title, message, urgency, groupId, onClickComm
  * Requires `terminal-notifier` to be installed (e.g. `brew install terminal-notifier`).
  *
  * @param {{ title: string; message: string; groupId?: string }} opts
+ * @param {unknown} client
+ * @param {{ desktopUnavailable: boolean }} notificationState
  * @returns {Promise<NotificationHandle | null>}
  */
-function sendDesktopNotificationMac({ title, message, groupId }) {
+function sendDesktopNotificationMac({ title, message, groupId }, client, notificationState) {
   const resolvedGroupId = groupId ?? randomUUID();
   const args = [
     '-title',   title,
@@ -200,11 +268,13 @@ function sendDesktopNotificationMac({ title, message, groupId }) {
   try {
     child = spawn('terminal-notifier', args, { stdio: 'ignore' });
   } catch (err) {
-    console.error('[opencode-notify] Failed to spawn terminal-notifier:', err);
+    notificationState.desktopUnavailable = true;
+    logPluginError(client, 'error', `Failed to spawn terminal-notifier: ${err.message}`);
     return Promise.resolve(null);
   }
   child.on('error', (err) => {
-    console.error('[opencode-notify] terminal-notifier error:', err);
+    notificationState.desktopUnavailable = true;
+    logPluginError(client, 'error', `terminal-notifier error: ${err.message}`);
   });
   child.unref();
 
@@ -217,9 +287,11 @@ function sendDesktopNotificationMac({ title, message, groupId }) {
  * Dismiss is a no-op on this platform.
  *
  * @param {{ title: string; message: string }} opts
+ * @param {unknown} client
+ * @param {{ desktopUnavailable: boolean }} notificationState
  * @returns {Promise<NotificationHandle | null>}
  */
-function sendDesktopNotificationWindows({ title, message }) {
+function sendDesktopNotificationWindows({ title, message }, client, notificationState) {
   // Escape XML special chars before embedding in the toast XML template.
   const escXml = (s) => s
     .replace(/&/g, '&amp;')
@@ -246,11 +318,13 @@ function sendDesktopNotificationWindows({ title, message }) {
   try {
     child = spawn('powershell', ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], { stdio: 'ignore' });
   } catch (err) {
-    console.error('[opencode-notify] Failed to spawn powershell for toast notification:', err);
+    notificationState.desktopUnavailable = true;
+    logPluginError(client, 'error', `Failed to spawn powershell for toast notification: ${err.message}`);
     return Promise.resolve(null);
   }
   child.on('error', (err) => {
-    console.error('[opencode-notify] powershell toast error:', err);
+    notificationState.desktopUnavailable = true;
+    logPluginError(client, 'error', `powershell toast error: ${err.message}`);
   });
   child.unref();
 
@@ -278,9 +352,11 @@ function sendDesktopNotificationWindows({ title, message }) {
  *   urgency?: string;
  *   onClickCommand?: string;
  * }} opts
+ * @param {unknown} client
+ * @param {{ desktopUnavailable: boolean }} notificationState
  * @returns {Promise<NotificationHandle | null>}
  */
-function sendDesktopNotificationLinux({ title, message, urgency, onClickCommand }) {
+function sendDesktopNotificationLinux({ title, message, urgency, onClickCommand }, client, notificationState) {
   // Map string urgency name → D-Bus byte value
   const urgencyByte = urgency === 'critical' ? 2 : urgency === 'low' ? 0 : 1;
   const hintsArg = `{'urgency': <byte ${urgencyByte}>}`;
@@ -308,13 +384,15 @@ function sendDesktopNotificationLinux({ title, message, urgency, onClickCommand 
         stdio: ['ignore', 'pipe', 'pipe'],
       });
     } catch (err) {
-      console.error('[opencode-notify] Failed to spawn gdbus:', err);
+      notificationState.desktopUnavailable = true;
+      logPluginError(client, 'error', `Failed to spawn gdbus: ${err.message}`);
       resolve(null);
       return;
     }
 
     child.on('error', (err) => {
-      console.error('[opencode-notify] gdbus Notify failed:', err);
+      notificationState.desktopUnavailable = true;
+      logPluginError(client, 'error', `gdbus Notify failed: ${err.message}`);
       resolve(null);
     });
 
@@ -326,7 +404,7 @@ function sendDesktopNotificationLinux({ title, message, urgency, onClickCommand 
       // D-Bus Notify returns "(uint32 NNN,)"
       const match = stdout.match(/\(uint32 (\d+),\)/);
       if (!match) {
-        console.error('[opencode-notify] gdbus Notify returned unexpected output:', stdout.trim());
+        logPluginError(client, 'error', `gdbus Notify returned unexpected output: ${stdout.trim()}`);
         resolve(null);
         return;
       }
@@ -337,12 +415,12 @@ function sendDesktopNotificationLinux({ title, message, urgency, onClickCommand 
       // button still works.  The monitor process exits on its own once the
       // notification is dismissed or times out.
       if (onClickCommand) {
-        subscribeLinuxActionInvoked(id, onClickCommand);
+        subscribeLinuxActionInvoked(id, onClickCommand, client);
       }
     });
 
     child.stderr.on('data', (chunk) => {
-      console.error('[opencode-notify] gdbus Notify stderr:', chunk.toString().trim());
+      logPluginError(client, 'error', `gdbus Notify stderr: ${chunk.toString().trim()}`);
     });
   });
 }
@@ -356,8 +434,9 @@ function sendDesktopNotificationLinux({ title, message, urgency, onClickCommand 
  * @param {number} id             Numeric notification ID returned by Notify.
  * @param {string} onClickCommand Shell command to execute; `${NODE_PID}` is
  *                                substituted with `process.pid`.
+ * @param {unknown} client
  */
-function subscribeLinuxActionInvoked(id, onClickCommand) {
+function subscribeLinuxActionInvoked(id, onClickCommand, client) {
   let monitor;
   try {
     monitor = spawn('gdbus', [
@@ -368,12 +447,12 @@ function subscribeLinuxActionInvoked(id, onClickCommand) {
       stdio: ['ignore', 'pipe', 'ignore'],
     });
   } catch (err) {
-    console.error('[opencode-notify] Failed to spawn gdbus monitor:', err);
+    logPluginError(client, 'error', `Failed to spawn gdbus monitor: ${err.message}`);
     return;
   }
 
   monitor.on('error', (err) => {
-    console.error('[opencode-notify] gdbus monitor error:', err);
+    logPluginError(client, 'error', `gdbus monitor error: ${err.message}`);
   });
 
   let buffer = '';
@@ -389,7 +468,7 @@ function subscribeLinuxActionInvoked(id, onClickCommand) {
       if (actionMatch && Number(actionMatch[1]) === id && actionMatch[2] === 'default') {
         const cmd = onClickCommand.replaceAll('${NODE_PID}', String(process.pid));
         exec(cmd, (err) => {
-          if (err) console.error('[opencode-notify] onClickCommand failed:', err);
+          if (err) logPluginError(client, 'error', `onClickCommand failed: ${err.message}`);
         });
         monitor.kill();
         return;
@@ -423,9 +502,10 @@ function subscribeLinuxActionInvoked(id, onClickCommand) {
  * Passing `null` or `undefined` is always a safe no-op.
  *
  * @param {NotificationHandle | null | undefined} handle
+ * @param {unknown} client
  * @returns {void}
  */
-function closeDesktopNotification(handle) {
+function closeDesktopNotification(handle, client) {
   if (!handle) return;
 
   if (handle.platform === 'linux') {
@@ -440,11 +520,11 @@ function closeDesktopNotification(handle) {
     try {
       child = spawn('gdbus', args, { stdio: 'ignore' });
     } catch (err) {
-      console.error('[opencode-notify] closeDesktopNotification failed to spawn gdbus:', err);
+      logPluginError(client, 'error', `closeDesktopNotification failed to spawn gdbus: ${err.message}`);
       return;
     }
     child.on('error', (err) => {
-      console.error('[opencode-notify] gdbus CloseNotification error:', err);
+      logPluginError(client, 'error', `gdbus CloseNotification error: ${err.message}`);
     });
     child.unref();
     return;
@@ -456,11 +536,11 @@ function closeDesktopNotification(handle) {
     try {
       child = spawn('terminal-notifier', args, { stdio: 'ignore' });
     } catch (err) {
-      console.error('[opencode-notify] closeDesktopNotification (macOS) failed to spawn terminal-notifier:', err);
+      logPluginError(client, 'error', `closeDesktopNotification (macOS) failed to spawn terminal-notifier: ${err.message}`);
       return;
     }
     child.on('error', (err) => {
-      console.error('[opencode-notify] terminal-notifier -remove error:', err);
+      logPluginError(client, 'error', `terminal-notifier -remove error: ${err.message}`);
     });
     child.unref();
     return;
@@ -471,12 +551,13 @@ function closeDesktopNotification(handle) {
 
 /**
  * POSTs `payload` as JSON to every configured webhook URL, concurrently.
- * Errors are logged to stderr and never propagate.
+ * Errors are logged via `client.app.log` and never propagate.
  *
  * @param {Array<{ url: string; headers?: Record<string, string> }>} webhooks
  * @param {Record<string, unknown>} payload
+ * @param {unknown} client
  */
-async function dispatchWebhooks(webhooks, payload) {
+async function dispatchWebhooks(webhooks, payload, client) {
   try {
     const body = JSON.stringify(payload);
     const requests = webhooks.map(({ url, headers = {} }) =>
@@ -488,13 +569,13 @@ async function dispatchWebhooks(webhooks, payload) {
         },
         body,
       }).catch((err) => {
-        console.error(`[opencode-notify] Webhook POST to ${url} failed:`, err);
+        logPluginError(client, 'error', `Webhook POST to ${url} failed: ${err.message}`);
       }),
     );
 
     await Promise.allSettled(requests);
   } catch (err) {
-    console.error('[opencode-notify] Webhook dispatch failed:', err);
+    logPluginError(client, 'error', `Webhook dispatch failed: ${err.message}`);
   }
 }
 
@@ -721,7 +802,7 @@ async function isOpencodeWindowFocused() {
 /**
  * opencode plugin factory.
  *
- * @param {{ client: unknown; $: unknown }} input  – opencode plugin input (unused directly)
+ * @param {{ client: { app?: { log?: (arg: unknown) => Promise<unknown> } }; $: unknown }} input  – opencode plugin input; only `client` is consumed
  * @param {{
  *   desktop?: boolean;
  *   webhooks?: Array<{ url: string; headers?: Record<string, string> }>;
@@ -730,17 +811,38 @@ async function isOpencodeWindowFocused() {
  * }} options
  * @returns {Promise<import('@opencode-ai/plugin').Hooks>}
  */
-export default async function opencodeNotify(_input, options = {}) {
+export default async function opencodeNotify({ client }, options = {}) {
   // When loaded via auto-discovery (symlink in plugins/), opencode cannot pass
   // options from opencode.jsonc.  Read the optional config file and merge it
   // under any caller-supplied options so the explicit form always takes
   // precedence (npm-name install with inline options wins over the file).
-  const fileOptions = await readConfigFile();
+  const fileOptions = await readConfigFile(client);
   const resolved = { ...fileOptions, ...options };
 
   const desktopEnabled = resolved.desktop ?? true;
   const webhooks = resolved.webhooks ?? [];
   const onClickCommand = resolved.onClickCommand;
+
+  /**
+   * Per-instance desktop-notification circuit breaker. Once a spawn attempt
+   * for the platform's notification backend fails (binary missing, no
+   * daemon/session bus reachable, etc.), this flips to `true` and every
+   * subsequent `sendDesktopNotification` call short-circuits immediately —
+   * so a missing notification daemon logs at most once per process
+   * lifetime instead of once per event.
+   *
+   * @type {{ desktopUnavailable: boolean }}
+   */
+  const notificationState = { desktopUnavailable: false };
+
+  if (desktopEnabled && isDesktopEnvironmentUnavailable()) {
+    notificationState.desktopUnavailable = true;
+    logPluginError(
+      client,
+      'info',
+      'No graphical session detected (DISPLAY, WAYLAND_DISPLAY, and DBUS_SESSION_BUS_ADDRESS are all unset); desktop notifications disabled for this session.',
+    );
+  }
 
   /**
    * Per-event notification toggles.  Each key defaults to `true`; set to
@@ -836,7 +938,7 @@ export default async function opencodeNotify(_input, options = {}) {
             // If a duplicate permission.asked arrives for the same requestID,
             // close the previous notification first.
             if (permissionNotifHandleCache.has(requestID)) {
-              closeDesktopNotification(permissionNotifHandleCache.get(requestID));
+              closeDesktopNotification(permissionNotifHandleCache.get(requestID), client);
               permissionNotifHandleCache.delete(requestID);
             }
 
@@ -846,7 +948,7 @@ export default async function opencodeNotify(_input, options = {}) {
               urgency: 'critical',
               groupId: requestID,
               onClickCommand,
-            });
+            }, client, notificationState);
             if (handle !== null) {
               permissionNotifHandleCache.set(requestID, handle);
             }
@@ -858,7 +960,7 @@ export default async function opencodeNotify(_input, options = {}) {
               sessionID,
               sessionTitle,
               permissionTitle: permission.permission,
-            });
+            }, client);
           }
           break;
         }
@@ -868,7 +970,7 @@ export default async function opencodeNotify(_input, options = {}) {
         // -----------------------------------------------------------------
         case 'permission.replied': {
           const { requestID } = event.properties;
-          closeDesktopNotification(permissionNotifHandleCache.get(requestID));
+          closeDesktopNotification(permissionNotifHandleCache.get(requestID), client);
           permissionNotifHandleCache.delete(requestID);
           break;
         }
@@ -909,7 +1011,7 @@ export default async function opencodeNotify(_input, options = {}) {
                   title: 'opencode \u2013 Todo Done',
                   message: `${todo.content}\n${sessionTitle}`,
                   onClickCommand,
-                });
+                }, client, notificationState);
               }
 
               if (webhooks.length > 0) {
@@ -918,7 +1020,7 @@ export default async function opencodeNotify(_input, options = {}) {
                   sessionID,
                   sessionTitle,
                   todoContent: todo.content,
-                });
+                }, client);
               }
             }
 
@@ -945,7 +1047,7 @@ export default async function opencodeNotify(_input, options = {}) {
                 title: 'opencode \u2013 Task Done',
                 message: sessionTitle,
                 onClickCommand,
-              });
+              }, client, notificationState);
             }
           }
 
@@ -954,7 +1056,7 @@ export default async function opencodeNotify(_input, options = {}) {
               event: 'session_idle',
               sessionID,
               sessionTitle,
-            });
+            }, client);
           }
           break;
         }
@@ -977,7 +1079,7 @@ export default async function opencodeNotify(_input, options = {}) {
                 message: sessionTitle,
                 urgency: 'critical',
                 onClickCommand,
-              });
+              }, client, notificationState);
             }
           }
 
@@ -986,7 +1088,7 @@ export default async function opencodeNotify(_input, options = {}) {
               event: 'session_error',
               sessionID,
               sessionTitle,
-            });
+            }, client);
           }
           break;
         }
@@ -1010,7 +1112,7 @@ export default async function opencodeNotify(_input, options = {}) {
             // or question.rejected. If a duplicate question.asked arrives for the
             // same requestID, close the previous notification first.
             if (questionNotifHandleCache.has(requestID)) {
-              closeDesktopNotification(questionNotifHandleCache.get(requestID));
+              closeDesktopNotification(questionNotifHandleCache.get(requestID), client);
               questionNotifHandleCache.delete(requestID);
             }
 
@@ -1018,7 +1120,7 @@ export default async function opencodeNotify(_input, options = {}) {
               title: notifTitle,
               message: notifMessage,
               onClickCommand,
-            });
+            }, client, notificationState);
             if (handle !== null) {
               questionNotifHandleCache.set(requestID, handle);
             }
@@ -1031,7 +1133,7 @@ export default async function opencodeNotify(_input, options = {}) {
               sessionTitle,
               questionHeader: questions[0]?.header,
               questionBody: questions[0]?.question,
-            });
+            }, client);
           }
           break;
         }
@@ -1042,7 +1144,7 @@ export default async function opencodeNotify(_input, options = {}) {
         case 'question.replied':
         case 'question.rejected': {
           const { requestID } = event.properties;
-          closeDesktopNotification(questionNotifHandleCache.get(requestID));
+          closeDesktopNotification(questionNotifHandleCache.get(requestID), client);
           questionNotifHandleCache.delete(requestID);
           break;
         }
