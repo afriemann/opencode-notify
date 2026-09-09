@@ -53,7 +53,7 @@ The file is optional — omitting it uses the defaults listed in [Options](#opti
 |-----|----------------|---------|-------------|
 | `taskFinished` | `session.idle` | `true` | "Task Done" — fired when a session becomes idle |
 | `questionAsked` | `question.asked` | `true` | Question prompt — fired when opencode asks the user a question |
-| `permissionRequested` | `permission.asked` | `true` | Permission request — fired when opencode needs user approval |
+| `permissionRequested` | `permission.asked` | `true` | Permission request — fired when opencode needs user approval. Also accepts an object — see [Permission request options](#permission-request-options) |
 | `todoCompleted` | `todo.updated` | `true` | Todo done — fired when an individual todo transitions to `completed` |
 | `sessionError` | `session.error` | `true` | Session error — fired when a session encounters an error |
 
@@ -64,6 +64,31 @@ The file is optional — omitting it uses the defaults listed in [Options](#opti
   "notifications": {
     "taskFinished": false,
     "todoCompleted": false
+  }
+}
+```
+
+#### Permission request options
+
+`permissionRequested` accepts either a boolean (enable/disable, as above) or an object with additional overrides:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | `boolean` | `true` | Enable/disable the notification |
+| `urgency` | `'low' \| 'normal' \| 'critical'` | `'normal'` | Desktop notification urgency |
+| `expireTimeoutMs` | `number` | `20000` | Auto-dismiss the notification after this many milliseconds if it hasn't already been dismissed (via `permission.replied`). Set to `0` to disable auto-dismiss. |
+
+**Why this matters:** when opencode's "auto"/allow-all permission mode is active, permission requests are approved almost instantly — well within the time it takes the plugin to spawn the OS notification process. Without an auto-dismiss timeout, a `critical`-urgency notification could linger on screen indefinitely, requiring a manual dismissal for every tool call. The 20-second default auto-dismiss (plus a race-condition fix that closes the notification immediately if the reply arrives before the notification finishes sending) keeps a burst of auto-approved permission requests from piling up as a wall of notifications you have to click through.
+
+**Example** — critical urgency with a shorter auto-dismiss:
+
+```json
+{
+  "notifications": {
+    "permissionRequested": {
+      "urgency": "critical",
+      "expireTimeoutMs": 8000
+    }
   }
 }
 ```
@@ -94,7 +119,7 @@ To disable focus detection and always notify: set `skipIfFocused: false`.
 On Linux, every desktop notification includes a **"Focus opencode"** action button.
 Notifications are sent via `gdbus call … org.freedesktop.Notifications.Notify` directly — no dependency on `notify-send`. `gdbus` is part of GLib (`glib2` / `libglib2.0-bin`), which is present on virtually every Linux desktop.
 
-- **Permission notifications** use `urgency=critical`, which may cause your compositor to raise the opencode window automatically. When the user approves or rejects the request, the notification is automatically dismissed.
+- **Permission notifications** use `urgency=normal` by default (configurable — see [Permission request options](#permission-request-options)) and auto-dismiss after 20 seconds even if never explicitly replied to. When the user approves or rejects the request, the notification is dismissed immediately instead of waiting for the timeout.
 - **Todo notifications** use default urgency.
 - If `onClickCommand` is set and non-empty, it is executed via `child_process.exec` when the user clicks the action. If `onClickCommand` is absent or empty the click is a no-op (the action button is still shown but does nothing beyond dismissing the notification).
 

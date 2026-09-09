@@ -147,6 +147,30 @@ function logPluginError(client, level, message, extra) {
 }
 
 /**
+ * Resolves a per-event notification config value that may be either the
+ * legacy boolean shorthand (enable/disable only) or an object of overrides
+ * for that event's notification behaviour (e.g. `urgency`, `expireTimeoutMs`).
+ * Always returns a fully-populated object: `defaults` merged under any
+ * object-shape overrides, or `{ ...defaults, enabled: value }` for a boolean,
+ * or `defaults` unchanged for `undefined`/`null`/an array.
+ *
+ * @template {{ enabled: boolean }} T
+ * @param {boolean | Partial<T> | null | undefined} value
+ * @param {T} defaults
+ * @returns {T}
+ */
+function resolveNotificationConfig(value, defaults) {
+  if (typeof value === 'boolean') {
+    return { ...defaults, enabled: value };
+  }
+  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+    return { ...defaults, ...value };
+  }
+  return defaults;
+}
+export { resolveNotificationConfig };
+
+/**
  * Returns `true` when no graphical/D-Bus session is detectable on Linux —
  * i.e. `DISPLAY`, `WAYLAND_DISPLAY`, and `DBUS_SESSION_BUS_ADDRESS` are all
  * unset. This is the common case for opencode running on a bare tty with no
@@ -225,18 +249,19 @@ const DBUS_IFACE   = 'org.freedesktop.Notifications';
  *   urgency?: string;
  *   groupId?: string;
  *   onClickCommand?: string;
+ *   expireTimeoutMs?: number;
  * }} opts
  * @param {unknown} client
  * @param {{ desktopUnavailable: boolean }} notificationState
  * @returns {Promise<NotificationHandle | null>}
  */
-function sendDesktopNotification({ title, message, urgency, groupId, onClickCommand }, client, notificationState) {
+function sendDesktopNotification({ title, message, urgency, groupId, onClickCommand, expireTimeoutMs }, client, notificationState) {
   if (notificationState.desktopUnavailable) {
     return Promise.resolve(null);
   }
 
   if (process.platform === 'linux') {
-    return sendDesktopNotificationLinux({ title, message, urgency, onClickCommand }, client, notificationState);
+    return sendDesktopNotificationLinux({ title, message, urgency, onClickCommand, expireTimeoutMs }, client, notificationState);
   }
 
   if (process.platform === 'darwin') {
@@ -346,22 +371,33 @@ function sendDesktopNotificationWindows({ title, message }, client, notification
  * Urgency is passed as a D-Bus hint: `{'urgency': <byte N>}` where
  *   0 = low, 1 = normal, 2 = critical.
  *
+ * `expire_timeout` is passed straight through in milliseconds, matching the
+ * D-Bus `Notify` signature. Note that several notification daemons ignore it
+ * regardless of urgency (GNOME Shell, Notify OSD), and some ignore it
+ * specifically for `critical`-urgency notifications (KDE Plasma) — see
+ * `man notify-send`. Callers that need a reliable auto-dismiss across daemons
+ * must also arrange to call `closeDesktopNotification` themselves after this
+ * many milliseconds (see the `permission.asked` handler).
+ *
  * @param {{
  *   title: string;
  *   message: string;
  *   urgency?: string;
  *   onClickCommand?: string;
+ *   expireTimeoutMs?: number;
  * }} opts
  * @param {unknown} client
  * @param {{ desktopUnavailable: boolean }} notificationState
  * @returns {Promise<NotificationHandle | null>}
  */
-function sendDesktopNotificationLinux({ title, message, urgency, onClickCommand }, client, notificationState) {
+function sendDesktopNotificationLinux({ title, message, urgency, onClickCommand, expireTimeoutMs }, client, notificationState) {
   // Map string urgency name → D-Bus byte value
   const urgencyByte = urgency === 'critical' ? 2 : urgency === 'low' ? 0 : 1;
   const hintsArg = `{'urgency': <byte ${urgencyByte}>}`;
 
-  // expire_timeout: 0 = notification server decides (never expires for critical)
+  // expire_timeout in milliseconds; 0 = notification server decides (may mean
+  // "never expires"). Defaults to 0 (native behaviour unchanged) when omitted.
+  const expireTimeoutArg = String(expireTimeoutMs ?? 0);
   const args = [
     'call', '--session',
     '--dest', DBUS_DEST,
@@ -374,7 +410,7 @@ function sendDesktopNotificationLinux({ title, message, urgency, onClickCommand 
     message,                  // body
     "['default', 'Focus opencode']", // actions
     hintsArg,                 // hints
-    '0',                      // expire_timeout
+    expireTimeoutArg,         // expire_timeout
   ];
 
   return new Promise((resolve) => {
@@ -852,16 +888,37 @@ export default async function opencodeNotify({ client }, options = {}) {
    * Supported keys (all under a `notifications` object):
    *   - `taskFinished`         → session.idle
    *   - `questionAsked`        → question.asked
-   *   - `permissionRequested`  → permission.asked
+   *   - `permissionRequested`  → permission.asked (boolean, or an object —
+   *                              see `resolveNotificationConfig`)
    *   - `todoCompleted`        → todo.updated
    *   - `sessionError`         → session.error
    */
   const notifCfg = resolved.notifications ?? {};
   const notifyTaskFinished        = notifCfg.taskFinished        ?? true;
   const notifyQuestionAsked       = notifCfg.questionAsked       ?? true;
-  const notifyPermissionRequested = notifCfg.permissionRequested ?? true;
   const notifyTodoCompleted       = notifCfg.todoCompleted       ?? true;
   const notifySessionError        = notifCfg.sessionError        ?? true;
+
+  /**
+   * Permission-request notification config. Accepts either a boolean
+   * (legacy enable/disable shorthand) or an object with `enabled`, `urgency`,
+   * and `expireTimeoutMs` overrides.
+   *
+   * Defaults: `urgency: 'normal'` (not `'critical'`) and
+   * `expireTimeoutMs: 20000` (auto-dismiss after 20s) rather than never
+   * expiring. This matters because opencode's "auto"/allow-all permission
+   * mode replies to a permission request almost instantly — if the plugin's
+   * async notification send races behind that reply, a `critical` /
+   * never-expiring notification is left on screen indefinitely. See the
+   * `permission.asked`/`permission.replied` handlers below for the
+   * complementary race fix.
+   */
+  const permissionCfg = resolveNotificationConfig(notifCfg.permissionRequested, {
+    enabled: true,
+    urgency: 'normal',
+    expireTimeoutMs: 20000,
+  });
+  const notifyPermissionRequested = permissionCfg.enabled;
 
   /**
    * Cache of sessionID → session title.
@@ -891,6 +948,22 @@ export default async function opencodeNotify({ client }, options = {}) {
    * @type {Map<string, NotificationHandle>}
    */
   const permissionNotifHandleCache = new Map();
+
+  /**
+   * Set of permission requestIDs that received a `permission.replied` event
+   * before their `permission.asked` notification finished sending (i.e.
+   * before `permissionNotifHandleCache` had a handle to close). This race
+   * happens routinely under opencode's "auto"/allow-all permission mode,
+   * which replies to a request almost instantly — well within the time it
+   * takes to spawn `gdbus`/`terminal-notifier` and get a handle back. Without
+   * this cache, such a notification would never be closed and would linger
+   * on screen indefinitely (worse, permanently, given `critical` urgency
+   * previously never expired). Consumed the moment the notify call resolves
+   * — see the `permission.asked` handler.
+   *
+   * @type {Set<string>}
+   */
+  const permissionRepliedEarlyCache = new Set();
 
   /**
    * Cache of question requestID → NotificationHandle.
@@ -945,12 +1018,37 @@ export default async function opencodeNotify({ client }, options = {}) {
             const handle = await sendDesktopNotification({
               title: 'opencode \u2013 Permission Request',
               message: `${permission.permission}\n${sessionTitle}`,
-              urgency: 'critical',
+              urgency: permissionCfg.urgency,
+              expireTimeoutMs: permissionCfg.expireTimeoutMs,
               groupId: requestID,
               onClickCommand,
             }, client, notificationState);
+
+            // If `permission.replied` already fired while we were awaiting the
+            // notify call above (the race described on `permissionRepliedEarlyCache`),
+            // close the notification immediately instead of caching it as open.
+            const repliedEarly = permissionRepliedEarlyCache.delete(requestID);
             if (handle !== null) {
-              permissionNotifHandleCache.set(requestID, handle);
+              if (repliedEarly) {
+                closeDesktopNotification(handle, client);
+              } else {
+                permissionNotifHandleCache.set(requestID, handle);
+
+                // Cross-platform (Linux + macOS) fallback auto-dismiss: several
+                // notification daemons ignore the native `expire_timeout` hint
+                // entirely, or specifically for `critical` urgency (see
+                // `sendDesktopNotificationLinux`), so we also close the
+                // notification ourselves after `expireTimeoutMs`.
+                if (permissionCfg.expireTimeoutMs > 0) {
+                  const timer = setTimeout(() => {
+                    if (permissionNotifHandleCache.get(requestID) === handle) {
+                      closeDesktopNotification(handle, client);
+                      permissionNotifHandleCache.delete(requestID);
+                    }
+                  }, permissionCfg.expireTimeoutMs);
+                  timer.unref?.();
+                }
+              }
             }
           }
 
@@ -970,8 +1068,22 @@ export default async function opencodeNotify({ client }, options = {}) {
         // -----------------------------------------------------------------
         case 'permission.replied': {
           const { requestID } = event.properties;
-          closeDesktopNotification(permissionNotifHandleCache.get(requestID), client);
-          permissionNotifHandleCache.delete(requestID);
+          if (permissionNotifHandleCache.has(requestID)) {
+            closeDesktopNotification(permissionNotifHandleCache.get(requestID), client);
+            permissionNotifHandleCache.delete(requestID);
+          } else if (desktopEnabled && notifyPermissionRequested) {
+            // The notify call for this request hasn't resolved yet (see the
+            // race documented on `permissionRepliedEarlyCache`) — remember it
+            // so `permission.asked` closes the notification the instant it's
+            // created instead of leaving it cached as still-open. Only worth
+            // remembering when a notify call could plausibly still be in
+            // flight — otherwise (desktop notifications disabled entirely,
+            // or this event silenced) this Set would grow unboundedly for
+            // the lifetime of the process with entries that are never
+            // consumed, since `permission.asked` never reaches the code that
+            // deletes them.
+            permissionRepliedEarlyCache.add(requestID);
+          }
           break;
         }
 
