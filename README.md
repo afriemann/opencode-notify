@@ -75,18 +75,22 @@ The file is optional — omitting it uses the defaults listed in [Options](#opti
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | `boolean` | `true` | Enable/disable the notification |
-| `urgency` | `'low' \| 'normal' \| 'critical'` | `'normal'` | Desktop notification urgency |
-| `expireTimeoutMs` | `number` | `20000` | Auto-dismiss the notification after this many milliseconds if it hasn't already been dismissed (via `permission.replied`). Set to `0` to disable auto-dismiss. |
+| `urgency` | `'low' \| 'normal' \| 'critical'` | `'critical'` | Desktop notification urgency |
+| `expireTimeoutMs` | `number` | `0` | Opt-in hard auto-dismiss timeout in milliseconds, independent of any reply. `0` (default) disables it. |
 
-**Why this matters:** when opencode's "auto"/allow-all permission mode is active, permission requests are approved almost instantly — well within the time it takes the plugin to spawn the OS notification process. Without an auto-dismiss timeout, a `critical`-urgency notification could linger on screen indefinitely, requiring a manual dismissal for every tool call. The 20-second default auto-dismiss (plus a race-condition fix that closes the notification immediately if the reply arrives before the notification finishes sending) keeps a burst of auto-approved permission requests from piling up as a wall of notifications you have to click through.
+**Why the safe default:** a pending permission request may still need a real human decision. This plugin cannot tell whether opencode's "auto"/allow-all permission mode or its "normal" manual mode is active — that toggle is client/TUI-local state, never sent to the server or included in the `permission.asked`/`permission.replied` event payloads — so it defaults to `critical` urgency and no auto-dismiss timer, exactly as if every request might need your attention.
 
-**Example** — critical urgency with a shorter auto-dismiss:
+The notification is still dismissed **immediately** the moment opencode actually replies to the request — whether that reply comes back near-instantly (allow-all mode) or after you click approve/deny (normal mode) — so a burst of auto-approved permission requests in allow-all mode does not pile up as a wall of notifications you have to click through. This close-on-reply also survives a race where the reply arrives before the notification has finished being sent to the OS.
+
+`expireTimeoutMs` is available if you also want a hard safety-net timeout that fires even if no reply is ever received (e.g. a crashed or abandoned session) — set it explicitly if you want that behavior; it is off by default because it would otherwise dismiss a still-pending request before you've had a chance to act on it.
+
+**Example** — lower urgency with a safety-net auto-dismiss (only recommended if you exclusively run in allow-all mode):
 
 ```json
 {
   "notifications": {
     "permissionRequested": {
-      "urgency": "critical",
+      "urgency": "normal",
       "expireTimeoutMs": 8000
     }
   }
@@ -119,7 +123,7 @@ To disable focus detection and always notify: set `skipIfFocused: false`.
 On Linux, every desktop notification includes a **"Focus opencode"** action button.
 Notifications are sent via `gdbus call … org.freedesktop.Notifications.Notify` directly — no dependency on `notify-send`. `gdbus` is part of GLib (`glib2` / `libglib2.0-bin`), which is present on virtually every Linux desktop.
 
-- **Permission notifications** use `urgency=normal` by default (configurable — see [Permission request options](#permission-request-options)) and auto-dismiss after 20 seconds even if never explicitly replied to. When the user approves or rejects the request, the notification is dismissed immediately instead of waiting for the timeout.
+- **Permission notifications** use `urgency=critical` by default with no auto-dismiss timer (configurable — see [Permission request options](#permission-request-options)). The notification is dismissed immediately once opencode actually replies to the request — whether that's a near-instant allow-all-mode reply or a manual approve/deny click — rather than requiring a manual dismissal or an artificial timeout.
 - **Todo notifications** use default urgency.
 - If `onClickCommand` is set and non-empty, it is executed via `child_process.exec` when the user clicks the action. If `onClickCommand` is absent or empty the click is a no-op (the action button is still shown but does nothing beyond dismissing the notification).
 

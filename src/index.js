@@ -904,19 +904,32 @@ export default async function opencodeNotify({ client }, options = {}) {
    * (legacy enable/disable shorthand) or an object with `enabled`, `urgency`,
    * and `expireTimeoutMs` overrides.
    *
-   * Defaults: `urgency: 'normal'` (not `'critical'`) and
-   * `expireTimeoutMs: 20000` (auto-dismiss after 20s) rather than never
-   * expiring. This matters because opencode's "auto"/allow-all permission
-   * mode replies to a permission request almost instantly — if the plugin's
-   * async notification send races behind that reply, a `critical` /
-   * never-expiring notification is left on screen indefinitely. See the
-   * `permission.asked`/`permission.replied` handlers below for the
-   * complementary race fix.
+   * Defaults: `urgency: 'critical'` and `expireTimeoutMs: 0` (no auto-dismiss
+   * timer). A pending permission request may still need a real human
+   * decision — opencode's "auto"/allow-all mode and its "normal" manual
+   * mode are indistinguishable to this plugin (the mode is client/TUI-local
+   * state, never sent to the server or exposed on the `permission.asked`/
+   * `permission.replied` event payloads), so the safe default must assume a
+   * human may be about to read and act on it, and must never soften or
+   * silently dismiss it while that decision is outstanding.
+   *
+   * What *does* fix "permanent notifications after every approved tool
+   * call" (the original complaint) is the `permission.replied`-driven close
+   * below, which fires the instant a reply is processed — whether that
+   * reply came back near-instantly (allow-all mode) or after a real human
+   * click (normal mode). See `permissionRepliedEarlyCache` for the race fix
+   * that makes that close-on-reply reliable even when the reply arrives
+   * before this plugin's own async notify call has resolved.
+   *
+   * `expireTimeoutMs` remains available as an opt-in hard safety-net timeout
+   * (independent of any reply) for anyone who explicitly wants one — but it
+   * is disabled by default because it would otherwise dismiss a
+   * still-pending manual-mode request before the user has acted on it.
    */
   const permissionCfg = resolveNotificationConfig(notifCfg.permissionRequested, {
     enabled: true,
-    urgency: 'normal',
-    expireTimeoutMs: 20000,
+    urgency: 'critical',
+    expireTimeoutMs: 0,
   });
   const notifyPermissionRequested = permissionCfg.enabled;
 

@@ -7,7 +7,10 @@ describe('resolveNotificationConfig', () => {
     ({ resolveNotificationConfig } = await import('./index.js'));
   });
 
-  const defaults = { enabled: true, urgency: 'normal', expireTimeoutMs: 20000 };
+  // Arbitrary fixture for exercising the generic merge-defaults helper in isolation —
+  // deliberately distinct from any real `permissionCfg` defaults so it can't be mistaken
+  // for an assertion about production notification behaviour.
+  const defaults = { enabled: true, urgency: 'low', expireTimeoutMs: 42 };
 
   it('returns the defaults when the value is undefined', () => {
     expect(resolveNotificationConfig(undefined, defaults)).toEqual(defaults);

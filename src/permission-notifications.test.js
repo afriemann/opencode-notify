@@ -69,7 +69,7 @@ describe('permission notification desktop behaviour (Linux)', () => {
     jest.useRealTimers();
   });
 
-  it('sends permission requests with normal urgency and the configured expire timeout by default', async () => {
+  it('sends permission requests with critical urgency and no auto-dismiss timeout by default', async () => {
     const hooks = await opencodeNotify({ client }, {});
 
     const asked = hooks.event({
@@ -85,14 +85,16 @@ describe('permission notification desktop behaviour (Linux)', () => {
 
     const hintsArg = notifyCalls[0].args.at(-2);
     const expireTimeoutArg = notifyCalls[0].args.at(-1);
-    expect(hintsArg).toBe("{'urgency': <byte 1>}"); // 1 = normal, not 2 = critical
-    expect(expireTimeoutArg).toBe('20000');
+    expect(hintsArg).toBe("{'urgency': <byte 2>}"); // 2 = critical (safe default — a pending
+    // request may still need a real human decision, so it must not be softened or silently
+    // dismissed while awaiting one)
+    expect(expireTimeoutArg).toBe('0'); // disabled by default; opt-in only
   });
 
   it('honors a configured urgency and expireTimeoutMs override', async () => {
     const hooks = await opencodeNotify(
       { client },
-      { notifications: { permissionRequested: { urgency: 'critical', expireTimeoutMs: 5000 } } },
+      { notifications: { permissionRequested: { urgency: 'normal', expireTimeoutMs: 5000 } } },
     );
 
     const asked = hooks.event({
@@ -107,7 +109,7 @@ describe('permission notification desktop behaviour (Linux)', () => {
 
     const hintsArg = notifyCalls[0].args.at(-2);
     const expireTimeoutArg = notifyCalls[0].args.at(-1);
-    expect(hintsArg).toBe("{'urgency': <byte 2>}");
+    expect(hintsArg).toBe("{'urgency': <byte 1>}");
     expect(expireTimeoutArg).toBe('5000');
   });
 
