@@ -3,7 +3,12 @@
   "version": "0.1.0",
   "description": "opencode plugin — desktop and webhook notifications for permission requests and finished tasks",
   "type": "module",
-  "main": "src/index.js",
+  "main": "src/plugin.v1.js",
+  "exports": {
+    ".": "./src/plugin.v1.js",
+    "./v1": "./src/plugin.v1.js",
+    "./v2": "./src/plugin.v2.js"
+  },
   "files": [
     "src"
   ],
@@ -14,13 +19,19 @@
     "testEnvironment": "node"
   },
   "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.15.0"
+    "@opencode-ai/plugin": ">=1.15.0",
+    "@opencode/plugin": "^2.0.4"
+  },
+  "peerDependenciesMeta": {
+    "@opencode-ai/plugin": { "optional": true },
+    "@opencode/plugin": { "optional": true }
   },
   "license": "MIT",
   "allowScripts": {
     "msgpackr-extract@3.0.4": true
   },
   "devDependencies": {
+    "@opencode/plugin": "^2.0.4",
     "jest": "^30.5.1"
   }
 }

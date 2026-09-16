@@ -4,13 +4,28 @@ opencode plugin that sends desktop notifications and optional webhook events whe
 
 ## Installation
 
-Clone the repository to your `~/.config/opencode/plugins` directory and link the `index.js`:
+Both opencode V1 (`@opencode-ai/plugin`) and V2 (`@opencode/cli` /
+`@opencode/plugin`) are supported, via separate entrypoint files.
+
+**V1:** clone the repository to your `~/.config/opencode/plugins` directory and link `plugin.v1.js`:
 
 ```bash
 git clone git@github.com:afriemann/opencode-notify ~/.config/opencode/plugins/opencode-notify
 cd ~/.config/opencode/plugins
-ln -s opencode-notify/src/index.js opencode-notify.js
+ln -s opencode-notify/src/plugin.v1.js opencode-notify.js
 ```
+
+**V2:** drop `src/plugin.v2.js` into a project's or the global
+`.opencode/plugins/` directory, with `src/core.js` (and its own relative
+import path adjusted) in a sibling `.opencode/lib/` directory —
+`.opencode/plugins/` scans every `.js` file placed directly inside it as its
+own candidate plugin, so shared modules must never live alongside it.
+
+On V2, **todo-completion notifications never fire** — no such event exists
+on that runtime (see `docs/v2-compat-audit.md`) — and question/form
+notifications use a reduced-scope mapping (notification only, using the
+form's title; the user's typed answer is never included in any notification
+or webhook payload).
 
 opencode will then automatically load the plugin on startup.
 
@@ -132,7 +147,7 @@ Notifications are sent via `gdbus call … org.freedesktop.Notifications.Notify`
 Hyprland v0.55 introduced `hl.dsp.focus({ window })` via `hyprctl eval`. To focus the opencode window by PID, set `onClickCommand` in your `opencode.jsonc`:
 
 ```jsonc
-["path/to/opencode-notify/src/index.js", {
+["path/to/opencode-notify/src/plugin.v1.js", {
   "desktop": true,
   "onClickCommand": "hyprctl eval \"hl.dsp.focus({ window = 'pid:${NODE_PID}' })\""
 }]
