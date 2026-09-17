@@ -43,9 +43,10 @@ The file is optional — omitting it uses the defaults listed in [Options](#opti
 |--------|------|---------|-------------|
 | `desktop` | `boolean` | `true` | Enable desktop notifications |
 | `skipIfFocused` | `boolean` | `true` | Suppress desktop notifications when the opencode window is already focused. See [Focus Detection](#focus-detection) for platform caveats. |
+| `terminalBell` | `boolean` | `true` | Ring the terminal bell (`\x07` to `/dev/tty`) on notification-worthy events. See [Terminal Bell](#terminal-bell). |
 | `webhooks` | `WebhookTarget[]` | `[]` | List of webhook targets to POST to |
 | `onClickCommand` | `string` | — | Shell command to run when the user clicks the "Focus opencode" action (Linux only). The literal string `${NODE_PID}` is replaced at runtime with the plugin's Node.js process PID. |
-| `notifications` | `object` | `{}` | Per-event notification toggles. All keys default to `true`; set a key to `false` to disable that event for **both** desktop and webhook channels. |
+| `notifications` | `object` | `{}` | Per-event notification toggles. All keys default to `true`; set a key to `false` to disable that event for **all channels** (desktop, terminal bell, and webhook). |
 
 ### Per-event toggles (`notifications` object)
 
@@ -117,6 +118,22 @@ Focus is detected by obtaining the focused window's owner PID (via `xprop` query
 If detection fails for any reason (no active window returned, unexpected error), the plugin logs a warning to stderr and sends the notification — notifications are never silently dropped.
 
 To disable focus detection and always notify: set `skipIfFocused: false`.
+
+## Terminal Bell
+
+When `terminalBell` is `true` (the default), the plugin rings the ASCII terminal bell (`\x07`) by writing directly to `/dev/tty` on every notification-worthy event — the same channels and focus-suppression rules as [Focus Detection](#focus-detection) apply (`permission.asked` and `question.asked` always ring the bell; the others respect `skipIfFocused`).
+
+This is deliberately a **terminal-mediated, window-manager-agnostic** mechanism, distinct from the desktop-notification channel above: it writes to the controlling TTY device rather than `process.stdout` (writing to this plugin's own stdout would interleave with, or be swallowed by, opencode's own TUI rendering), and it needs no `DISPLAY`/`WAYLAND_DISPLAY`/D-Bus session — so it also works over SSH.
+
+What happens when the bell rings depends entirely on your terminal emulator and window manager/compositor — this plugin sends only the raw `BEL` byte and does no window-manager-specific work itself:
+
+| Terminal | Behavior |
+|----------|----------|
+| Ghostty ≥ 1.2.0 | Marks the window/workspace as requesting attention (`bell-features` config, enabled by default) |
+| kitty, foot, alacritty, wezterm, xterm, gnome-terminal | Typically request window-manager attention on an unfocused bell (exact behavior varies by version/config) |
+| Ghostty ≤ 1.1.x, or any terminal with bell support disabled | No-op — the byte is simply ignored |
+
+If your terminal doesn't support bell-triggered attention, set `terminalBell: false` to skip the (harmless) write, or configure your terminal's bell behavior directly.
 
 ## Click to Focus (Linux)
 
