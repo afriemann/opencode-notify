@@ -16,7 +16,7 @@
  * module's vocabulary and call `notifier.handle(normalizedEvent)`.
  */
 
-import { readFile } from 'node:fs/promises';
+import { open, readFile } from 'node:fs/promises';
 import { spawn, exec } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -361,6 +361,87 @@ async function dispatchWebhooks(webhooks, payload, log) {
 }
 
 // ---------------------------------------------------------------------------
+// Terminal bell
+// ---------------------------------------------------------------------------
+
+/**
+ * Rings the terminal bell (ASCII BEL, `\x07`) by writing directly to the
+ * controlling terminal device (`/dev/tty`) rather than `process.stdout` —
+ * writing to this plugin's own stdout would interleave with (or be silently
+ * swallowed by) opencode's own TUI rendering pipeline, since that stream is
+ * not the real terminal screen buffer opencode itself owns.
+ *
+ * This is a deliberately terminal-mediated, window-manager-agnostic
+ * mechanism: terminal emulators that implement "bell requests attention"
+ * behaviour (Ghostty >=1.2.0, kitty, foot, alacritty, wezterm, xterm,
+ * gnome-terminal, ...) mark their own window urgent/attention-requesting
+ * using whichever protocol is correct for the current platform and window
+ * manager (Wayland `xdg_activation_v1`, X11 `_NET_WM_STATE_DEMANDS_ATTENTION`,
+ * etc.) — this plugin needs no compositor- or WM-specific IPC code at all.
+ * A terminal with no such support just beeps (or does nothing); this is a
+ * cheap, best-effort addition to the desktop-notification channel, not a
+ * replacement for it.
+ *
+ * POSIX-only (no-op on `win32`, which has no `/dev/tty` equivalent). Silent
+ * and best-effort: a missing controlling terminal (no TTY attached, running
+ * headless, etc.) is logged once via `notificationState.bellUnavailable` and
+ * never retried for the remainder of the process, so an unavailable TTY
+ * doesn't spam the log once per event.
+ *
+ * @param {(level: string, message: string, extra?: Record<string, unknown>) => void} log
+ * @param {{ bellUnavailable: boolean }} notificationState
+ * @returns {Promise<void>}
+ */
+async function ringTerminalBell(log, notificationState) {
+  if (notificationState.bellUnavailable || process.platform === 'win32') return;
+
+  let handle;
+  try {
+    handle = await open('/dev/tty', 'w');
+    await handle.write('\x07');
+  } catch (err) {
+    notificationState.bellUnavailable = true;
+    log('info', `Terminal bell unavailable (no controlling tty?): ${err.message}`);
+    return;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+/**
+ * Shared focus-gated dispatch for the two independent attention channels
+ * (desktop notification and terminal bell) used by the `session-idle` and
+ * `session-failed` handlers — both suppress on focus identically and differ
+ * only in what `sendDesktop` sends, so the gating logic lives here once
+ * rather than being copy-pasted per event.
+ *
+ * @param {object} input
+ * @param {boolean} input.desktopEnabled
+ * @param {boolean} input.terminalBellEnabled
+ * @param {boolean} input.skipIfFocused  Resolved `skipIfFocused` option (`resolved.skipIfFocused !== false`)
+ * @param {() => void} input.sendDesktop  Invoked (only if `desktopEnabled`) when not suppressed by focus
+ * @param {(level: string, message: string, extra?: Record<string, unknown>) => void} input.log
+ * @param {{ bellUnavailable: boolean }} input.notificationState
+ * @returns {Promise<void>}
+ */
+async function fireFocusGatedNotification({
+  desktopEnabled,
+  terminalBellEnabled,
+  skipIfFocused,
+  sendDesktop,
+  log,
+  notificationState,
+}) {
+  if (!desktopEnabled && !terminalBellEnabled) return;
+
+  const skip = skipIfFocused && (await isOpencodeWindowFocused());
+  if (skip) return;
+
+  if (desktopEnabled) sendDesktop();
+  if (terminalBellEnabled) await ringTerminalBell(log, notificationState);
+}
+
+// ---------------------------------------------------------------------------
 // Focus detection (unchanged from V1)
 // ---------------------------------------------------------------------------
 
@@ -499,6 +580,7 @@ async function isOpencodeWindowFocused() {
 /**
  * @param {{
  *   desktop?: boolean;
+ *   terminalBell?: boolean;
  *   webhooks?: Array<{ url: string; headers?: Record<string, string> }>;
  *   onClickCommand?: string;
  *   skipIfFocused?: boolean;
@@ -512,7 +594,15 @@ export function createNotifier(resolved, { log }) {
   const webhooks = resolved.webhooks ?? [];
   const onClickCommand = resolved.onClickCommand;
 
-  const notificationState = { desktopUnavailable: false };
+  /**
+   * Enables the terminal-bell channel (see `ringTerminalBell`). Independent
+   * of `desktopEnabled` — the bell needs no `DISPLAY`/`WAYLAND_DISPLAY`/D-Bus
+   * session, so it works over SSH and in other headless-desktop contexts
+   * where desktop notifications are unavailable.
+   */
+  const terminalBellEnabled = resolved.terminalBell ?? true;
+
+  const notificationState = { desktopUnavailable: false, bellUnavailable: false };
   if (desktopEnabled && isDesktopEnvironmentUnavailable()) {
     notificationState.desktopUnavailable = true;
     log('info', 'No graphical session detected (DISPLAY, WAYLAND_DISPLAY, and DBUS_SESSION_BUS_ADDRESS are all unset); desktop notifications disabled for this session.');
@@ -597,6 +687,12 @@ export function createNotifier(resolved, { log }) {
           }
         }
 
+        if (terminalBellEnabled) {
+          // permission requests always ring the bell regardless of focus,
+          // mirroring the desktop-notification behaviour above.
+          await ringTerminalBell(log, notificationState);
+        }
+
         if (webhooks.length > 0) {
           await dispatchWebhooks(webhooks, {
             event: 'permission_request',
@@ -631,15 +727,20 @@ export function createNotifier(resolved, { log }) {
           todoStateCache.set(sessionID, sessionTodos);
         }
 
-        const skip = desktopEnabled && resolved.skipIfFocused !== false && (await isOpencodeWindowFocused());
+        const skip = (desktopEnabled || terminalBellEnabled) && resolved.skipIfFocused !== false && (await isOpencodeWindowFocused());
 
         for (const todo of todos) {
           const prevStatus = sessionTodos.get(todo.content);
           const isNewlyCompleted = !isFirstSeen && prevStatus !== 'completed' && todo.status === 'completed';
 
           if (isNewlyCompleted) {
-            if (desktopEnabled && !skip) {
-              sendDesktopNotification({ title: 'opencode \u2013 Todo Done', message: `${todo.content}\n${sessionTitle}`, onClickCommand }, log, notificationState);
+            if (!skip) {
+              if (desktopEnabled) {
+                sendDesktopNotification({ title: 'opencode \u2013 Todo Done', message: `${todo.content}\n${sessionTitle}`, onClickCommand }, log, notificationState);
+              }
+              if (terminalBellEnabled) {
+                await ringTerminalBell(log, notificationState);
+              }
             }
             if (webhooks.length > 0) {
               await dispatchWebhooks(webhooks, { event: 'todo_completed', sessionID, sessionTitle, todoContent: todo.content }, log);
@@ -655,12 +756,14 @@ export function createNotifier(resolved, { log }) {
         const { sessionID } = event;
         const sessionTitle = resolveSessionTitle(sessionID);
 
-        if (desktopEnabled) {
-          const skip = resolved.skipIfFocused !== false && (await isOpencodeWindowFocused());
-          if (!skip) {
-            sendDesktopNotification({ title: 'opencode \u2013 Task Done', message: sessionTitle, onClickCommand }, log, notificationState);
-          }
-        }
+        await fireFocusGatedNotification({
+          desktopEnabled,
+          terminalBellEnabled,
+          skipIfFocused: resolved.skipIfFocused !== false,
+          sendDesktop: () => sendDesktopNotification({ title: 'opencode \u2013 Task Done', message: sessionTitle, onClickCommand }, log, notificationState),
+          log,
+          notificationState,
+        });
         if (webhooks.length > 0) {
           await dispatchWebhooks(webhooks, { event: 'session_idle', sessionID, sessionTitle }, log);
         }
@@ -672,17 +775,19 @@ export function createNotifier(resolved, { log }) {
         const { sessionID = 'unknown', errorMessage } = event;
         const sessionTitle = resolveSessionTitle(sessionID);
 
-        if (desktopEnabled) {
-          const skip = resolved.skipIfFocused !== false && (await isOpencodeWindowFocused());
-          if (!skip) {
-            sendDesktopNotification({
-              title: 'opencode \u2013 Session Error',
-              message: errorMessage ? `${sessionTitle}\n${errorMessage}` : sessionTitle,
-              urgency: 'critical',
-              onClickCommand,
-            }, log, notificationState);
-          }
-        }
+        await fireFocusGatedNotification({
+          desktopEnabled,
+          terminalBellEnabled,
+          skipIfFocused: resolved.skipIfFocused !== false,
+          sendDesktop: () => sendDesktopNotification({
+            title: 'opencode \u2013 Session Error',
+            message: errorMessage ? `${sessionTitle}\n${errorMessage}` : sessionTitle,
+            urgency: 'critical',
+            onClickCommand,
+          }, log, notificationState),
+          log,
+          notificationState,
+        });
         if (webhooks.length > 0) {
           await dispatchWebhooks(webhooks, { event: 'session_error', sessionID, sessionTitle, ...(errorMessage ? { errorMessage } : {}) }, log);
         }
@@ -706,6 +811,12 @@ export function createNotifier(resolved, { log }) {
           if (notifHandle !== null) {
             promptNotifHandleCache.set(requestID, notifHandle);
           }
+        }
+
+        if (terminalBellEnabled) {
+          // questions must always ring the bell regardless of focus state,
+          // mirroring the desktop-notification behaviour above.
+          await ringTerminalBell(log, notificationState);
         }
 
         if (webhooks.length > 0) {

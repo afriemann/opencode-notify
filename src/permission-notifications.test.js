@@ -70,7 +70,7 @@ describe('permission notification desktop behaviour (Linux)', () => {
   });
 
   it('sends permission requests with critical urgency and no auto-dismiss timeout by default', async () => {
-    const hooks = await opencodeNotify({ client }, {});
+    const hooks = await opencodeNotify({ client }, { terminalBell: false });
 
     const asked = hooks.event({
       event: {
@@ -94,7 +94,7 @@ describe('permission notification desktop behaviour (Linux)', () => {
   it('honors a configured urgency and expireTimeoutMs override', async () => {
     const hooks = await opencodeNotify(
       { client },
-      { notifications: { permissionRequested: { urgency: 'normal', expireTimeoutMs: 5000 } } },
+      { terminalBell: false, notifications: { permissionRequested: { urgency: 'normal', expireTimeoutMs: 5000 } } },
     );
 
     const asked = hooks.event({
@@ -114,7 +114,7 @@ describe('permission notification desktop behaviour (Linux)', () => {
   });
 
   it('closes the notification immediately if the reply races ahead of the async notify call', async () => {
-    const hooks = await opencodeNotify({ client }, {});
+    const hooks = await opencodeNotify({ client }, { terminalBell: false });
 
     // Do NOT await yet — the handler suspends at `await sendDesktopNotification`,
     // but the synchronous portion (including the `spawn` call) has already run.
@@ -143,7 +143,7 @@ describe('permission notification desktop behaviour (Linux)', () => {
     jest.useFakeTimers();
     const hooks = await opencodeNotify(
       { client },
-      { notifications: { permissionRequested: { expireTimeoutMs: 5000 } } },
+      { terminalBell: false, notifications: { permissionRequested: { expireTimeoutMs: 5000 } } },
     );
 
     const asked = hooks.event({
@@ -167,7 +167,7 @@ describe('permission notification desktop behaviour (Linux)', () => {
     jest.useFakeTimers();
     const hooks = await opencodeNotify(
       { client },
-      { notifications: { permissionRequested: { expireTimeoutMs: 0 } } },
+      { terminalBell: false, notifications: { permissionRequested: { expireTimeoutMs: 0 } } },
     );
 
     const asked = hooks.event({
