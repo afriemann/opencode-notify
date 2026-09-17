@@ -1,7 +1,15 @@
 import { jest } from '@jest/globals';
 import { SUPPORTED_KINDS } from './core.js';
-import { PRODUCIBLE_KINDS as V1_KINDS, normalizeV1Event } from './plugin.v1.js';
+import { PRODUCIBLE_KINDS as V1_KINDS, normalizeV1Event } from './normalize-v1.js';
 import PluginV2, { PRODUCIBLE_KINDS as V2_KINDS, normalizeV2Event } from './plugin.v2.js';
+
+// spec: openspec/changes/fix-v1-loader-named-export-crash/specs/plugin/spec.md
+describe('module export surface (opencode V1 legacy-plugin loader safety)', () => {
+  it('plugin.v1.js exports only default -- no named export reachable', async () => {
+    const mod = await import('./plugin.v1.js');
+    expect(Object.keys(mod)).toEqual(['default']);
+  });
+});
 
 describe('kind-subset cross-check (design.md)', () => {
   it('every kind either adapter can produce is one core.js handles', () => {
