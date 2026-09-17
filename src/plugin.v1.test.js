@@ -4,7 +4,7 @@ describe('resolveNotificationConfig', () => {
   let resolveNotificationConfig;
 
   beforeAll(async () => {
-    ({ resolveNotificationConfig } = await import('./plugin.v1.js'));
+    ({ resolveNotificationConfig } = await import('./core.js'));
   });
 
   // Arbitrary fixture for exercising the generic merge-defaults helper in isolation —
