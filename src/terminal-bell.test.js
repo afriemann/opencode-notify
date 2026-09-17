@@ -62,7 +62,7 @@ jest.unstable_mockModule('node:fs/promises', () => ({
 let opencodeNotify;
 
 beforeAll(async () => {
-  ({ default: opencodeNotify } = await import('./index.js'));
+  ({ default: opencodeNotify } = await import('./plugin.v1.js'));
 });
 
 describe('terminal bell (ring on notification-worthy events)', () => {

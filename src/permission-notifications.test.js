@@ -41,7 +41,7 @@ jest.unstable_mockModule('node:child_process', () => ({
 let opencodeNotify;
 
 beforeAll(async () => {
-  ({ default: opencodeNotify } = await import('./index.js'));
+  ({ default: opencodeNotify } = await import('./plugin.v1.js'));
 });
 
 /** Resolves the given fake Notify child with the given numeric notification id. */
