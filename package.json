@@ -20,7 +20,7 @@
   },
   "peerDependencies": {
     "@opencode-ai/plugin": ">=1.15.0",
-    "@opencode/plugin": "^2.0.4"
+    "@opencode/plugin": "^2.0.7"
   },
   "peerDependenciesMeta": {
     "@opencode-ai/plugin": { "optional": true },
@@ -31,7 +31,7 @@
     "msgpackr-extract@3.0.4": true
   },
   "devDependencies": {
-    "@opencode/plugin": "^2.0.4",
+    "@opencode/plugin": "^2.0.7",
     "jest": "^30.5.1"
   }
 }
