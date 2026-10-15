@@ -2,69 +2,88 @@ name: Dependabot auto-merge
 
 on:
   workflow_run:
-    workflows: ["CI"]
+    workflows: [CI]
     types: [completed]
 
-# workflow_run runs in the base-branch (main) context, so GITHUB_TOKEN carries
-# write access to merge PRs regardless of whether the source is a fork or bot.
-permissions:
-  contents: write
-  pull-requests: write
+permissions: {}
+
+concurrency:
+  group: dependabot-auto-merge-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
 
 jobs:
   auto-merge:
     name: Merge Dependabot PR
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Guard: CI must have succeeded for a Dependabot-authored branch.
-    # The if-check is at the job level so the job is entirely skipped (not just
-    # the steps) for non-Dependabot or failed workflow runs.
+    permissions:
+      contents: write
+      pull-requests: write
+      checks: read
+      statuses: read
     if: >-
       github.event.workflow_run.actor.login == 'dependabot[bot]' &&
+      github.event.workflow_run.event == 'pull_request' &&
       github.event.workflow_run.conclusion == 'success'
     steps:
-      - name: Find and merge Dependabot PR
+      - name: Approve and merge the green Dependabot revision
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
-          # Look up the open PR for the branch Dependabot ran CI on.
-          PR_NUMBER=$(gh pr list \
-            --repo "$REPO" \
-            --head "$HEAD_BRANCH" \
-            --author "dependabot[bot]" \
-            --state open \
-            --json number \
-            --jq '.[0].number // empty')
+          set -euo pipefail
+          IFS=$'\n\t'
+          export GH_REPO="$GITHUB_REPOSITORY"
+          manual() { echo "Manual review: $1"; exit 0; }
+          api() { gh api "repos/$GH_REPO/$1" --header 'Accept: application/vnd.github+json'; }
 
-          if [ -z "$PR_NUMBER" ]; then
-            echo "No open Dependabot PR for branch '$HEAD_BRANCH' — skipping."
-            exit 0
-          fi
+          jq -e --arg repo "$GH_REPO" '
+            .repository.full_name == $repo and
+            (.workflow_run | .name == "CI" and .event == "pull_request" and
+              .actor.login == "dependabot[bot]" and .conclusion == "success" and
+              .head_repository.full_name == $repo and (.pull_requests | length) == 1)
+          ' "$GITHUB_EVENT_PATH" > /dev/null || manual 'Not successful same-repository Dependabot PR CI'
+          pr=$(jq -er '.workflow_run.pull_requests[0].number | select(type == "number" and . > 0 and floor == .)' "$GITHUB_EVENT_PATH")
+          sha=$(jq -er '.workflow_run.head_sha | select(test("^[a-f0-9]{40}$"))' "$GITHUB_EVENT_PATH")
+          jq -e --arg sha "$sha" '.workflow_run.pull_requests[0].head.sha == $sha' "$GITHUB_EVENT_PATH" > /dev/null || manual 'Stale CI association'
 
-          PR_TITLE=$(gh pr view "$PR_NUMBER" \
-            --repo "$REPO" \
-            --json title \
-            --jq '.title')
+          current_pr() {
+            local details
+            details=$(api "pulls/$pr")
+            jq -e --arg repo "$GH_REPO" --arg sha "$sha" '
+              .state == "open" and .draft == false and .user.login == "dependabot[bot]" and
+              .head.sha == $sha and .head.repo.full_name == $repo and
+              .base.repo.full_name == $repo and .base.ref == "main"
+            ' <<< "$details" > /dev/null || manual 'PR identity or revision changed'
+          }
+          green_checks() {
+            local checks result=0
+            checks=$(gh pr checks "$pr" --repo "$GH_REPO" --json state) || result=$?
+            case "$result" in 0|1|8) ;; *) return "$result" ;; esac
+            jq -e 'type == "array"' <<< "$checks" > /dev/null
+            jq -e 'length > 0 and all(.state == "SUCCESS")' <<< "$checks" > /dev/null || manual 'No checks reported or checks are not all green'
+          }
 
-          echo "PR #$PR_NUMBER: $PR_TITLE"
+          current_pr
+          commits=$(api "pulls/$pr/commits")
+          jq -e --arg sha "$sha" '
+            length == 1 and .[0].sha == $sha and .[0].author.login == "dependabot[bot]" and
+            .[0].commit.verification.verified == true
+          ' <<< "$commits" > /dev/null || manual 'Not a single verified Dependabot commit'
+          # Classify the signed commit subject, not the editable PR title.
+          versions=$(jq -er --arg version '(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)' '
+            .[0].commit.message | split("\n")[0] |
+            capture("^build\\(deps(-dev)?\\): bump [A-Za-z0-9@_./-]+ from (?<old>" + $version + ") to (?<new>" + $version + ")$") |
+            [.old, .new] | @tsv
+          ' <<< "$commits") || manual 'Ambiguous or grouped update'
+          IFS=$'\t' read -r old new <<< "$versions"
+          [[ "${old%%.*}" == "${new%%.*}" && "$old" != "$new" ]] || manual 'Major or unchanged version'
+          printf '%s\n%s\n' "$old" "$new" | sort -VC || manual 'Version downgrade'
 
-          # For standard "Bump X from A.B.C to D.E.F" titles, skip when the
-          # leading (major) version component changes — warrants a manual review.
-          OLD_MAJOR=$(echo "$PR_TITLE" | grep -oP 'from \K\d+(?=\.)' | head -1)
-          NEW_MAJOR=$(echo "$PR_TITLE" | grep -oP ' to \K\d+(?=\.)' | head -1)
-
-          if [ -n "$OLD_MAJOR" ] && [ -n "$NEW_MAJOR" ] && [ "$OLD_MAJOR" != "$NEW_MAJOR" ]; then
-            echo "Major version bump ($OLD_MAJOR → $NEW_MAJOR) — skipping (manual review recommended)."
-            exit 0
-          fi
-
-          # Approve the PR. github-actions[bot] is a different identity from
-          # dependabot[bot], so this approval is allowed.
-          echo "Approving PR #$PR_NUMBER"
-          gh pr review "$PR_NUMBER" --approve --repo "$REPO"
-
-          # Squash-merge for a clean commit history on dependency bumps.
-          echo "Merging PR #$PR_NUMBER"
-          gh pr merge "$PR_NUMBER" --squash --repo "$REPO"
+          green_checks
+          current_pr
+          jq -n --arg sha "$sha" '{event: "APPROVE", commit_id: $sha}' |
+            gh api "repos/$GH_REPO/pulls/$pr/reviews" --method POST --header 'Accept: application/vnd.github+json' --input - > /dev/null
+          green_checks
+          current_pr
+          gh pr merge "$pr" --repo "$GH_REPO" --squash --match-head-commit "$sha"
