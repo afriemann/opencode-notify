@@ -31,7 +31,7 @@
     "msgpackr-extract@3.0.4": true
   },
   "devDependencies": {
-    "@opencode/plugin": "^2.0.25",
+    "@opencode/plugin": "^2.0.29",
     "jest": "^30.5.2"
   }
 }
