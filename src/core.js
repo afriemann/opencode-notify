@@ -1,19 +1,18 @@
 /**
  * opencode-notify – runtime-agnostic core.
  *
- * Holds every notification behavior that does NOT depend on which opencode
- * plugin API (V1 or V2) is hosting this plugin: OS notification back-ends
- * (Linux D-Bus, macOS `terminal-notifier`, Windows PowerShell toast), window-
- * focus detection (xprop/Hyprland/Sway), webhook dispatch, config-file
- * reading, and all per-session/per-request state (title cache, todo
- * transition tracking, notification-handle caches, the permission-reply race
- * fix).
+ * Holds every notification behavior that does not depend on the opencode
+ * plugin API: OS notification back-ends (Linux D-Bus, macOS
+ * `terminal-notifier`, Windows PowerShell toast), window-focus detection
+ * (xprop/Hyprland/Sway), webhook dispatch, config-file reading, and all
+ * per-session/per-request state (title cache, notification-handle caches,
+ * the permission-reply race fix).
  *
- * Consumes a `NormalizedEvent` union (design.md) instead of either runtime's
- * raw event shape — neither `@opencode-ai/plugin` nor `@opencode/plugin` is
- * ever imported here. `src/plugin.v1.js` and `src/plugin.v2.js` are the only
- * files that know each runtime's raw event shapes; both translate into this
- * module's vocabulary and call `notifier.handle(normalizedEvent)`.
+ * Consumes the `NormalizedEvent` union produced by `src/normalize-v2.js`;
+ * `@opencode/plugin` is never imported here. `src/plugin.v2.js` is the only
+ * file that knows the raw V2 event shapes and calls `notifier.handle(event)`.
+ *
+ * @typedef {{ kind: string, [key: string]: unknown }} NormalizedEvent
  */
 
 import { open, readFile } from 'node:fs/promises';
@@ -23,21 +22,40 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 // ---------------------------------------------------------------------------
-// NormalizedEvent kinds this core module handles (design.md's table).
-// Each adapter exports its own PRODUCIBLE_KINDS subset for the cross-check
-// test asserting it never claims to produce a kind core doesn't handle.
+// NormalizedEvent kinds this core module handles. The normalizer's
+// PRODUCIBLE_KINDS is cross-checked against this list in tests.
 // ---------------------------------------------------------------------------
 
 export const SUPPORTED_KINDS = Object.freeze([
   'session-titled',
   'permission-asked',
   'permission-replied',
-  'todos-updated',
   'session-idle',
   'session-failed',
+  'session-deleted',
   'prompt-asked',
   'prompt-resolved',
 ]);
+
+/** Upper bound on how long a session-title lookup may delay a notification. */
+const TITLE_LOOKUP_TIMEOUT_MS = 2000;
+
+/** Allowlisted, non-secret fields of an error for log `extra`. */
+export function errInfo(err) {
+  const info = {};
+  if (err?.name) info.errorName = err.name;
+  if (err?.code) info.code = err.code;
+  return info;
+}
+
+/** Host part of a webhook URL; the path and query may embed tokens. */
+function webhookHost(url) {
+  try {
+    return new URL(url).host;
+  } catch {
+    return 'invalid-url';
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -83,10 +101,29 @@ export async function readConfigFile(log) {
     return parsed;
   } catch (err) {
     if (err.code !== 'ENOENT') {
-      log('error', `Could not read config file (${CONFIG_FILE_PATH}): ${err.message}`, { path: CONFIG_FILE_PATH });
+      log('error', 'Could not read config file', { path: CONFIG_FILE_PATH, ...errInfo(err) });
     }
     return {};
   }
+}
+
+const isPlainObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+/**
+ * Merges plugin options over config-file options: every top-level key in
+ * `ctxOptions` replaces the file's, except `notifications`, which merges per
+ * category key when both sides are objects.
+ *
+ * @param {Record<string, unknown>} fileOptions
+ * @param {Record<string, unknown> | undefined} ctxOptions
+ * @returns {Record<string, unknown>}
+ */
+export function mergeOptions(fileOptions, ctxOptions) {
+  const merged = { ...fileOptions, ...(ctxOptions ?? {}) };
+  if (isPlainObject(fileOptions?.notifications) && isPlainObject(ctxOptions?.notifications)) {
+    merged.notifications = { ...fileOptions.notifications, ...ctxOptions.notifications };
+  }
+  return merged;
 }
 
 // ---------------------------------------------------------------------------
@@ -135,15 +172,21 @@ const DBUS_PATH = '/org/freedesktop/Notifications';
 const DBUS_IFACE = 'org.freedesktop.Notifications';
 
 // ---------------------------------------------------------------------------
-// sendDesktopNotification (Linux / macOS / Windows back-ends, unchanged from V1)
+// sendDesktopNotification (Linux / macOS / Windows back-ends)
 // ---------------------------------------------------------------------------
 
-function sendDesktopNotification({ title, message, urgency, groupId, onClickCommand, expireTimeoutMs }, log, notificationState) {
+/**
+ * @param {object} opts
+ * @param {(level: string, message: string, extra?: Record<string, unknown>) => void} log
+ * @param {{ desktopUnavailable: boolean }} notificationState
+ * @param {{ disposed: boolean, monitors: Set<import('node:child_process').ChildProcess> }} lifecycle
+ */
+function sendDesktopNotification({ title, message, urgency, groupId, onClickCommand, expireTimeoutMs }, log, notificationState, lifecycle) {
   if (notificationState.desktopUnavailable) {
     return Promise.resolve(null);
   }
   if (process.platform === 'linux') {
-    return sendDesktopNotificationLinux({ title, message, urgency, onClickCommand, expireTimeoutMs }, log, notificationState);
+    return sendDesktopNotificationLinux({ title, message, urgency, onClickCommand, expireTimeoutMs }, log, notificationState, lifecycle);
   }
   if (process.platform === 'darwin') {
     return sendDesktopNotificationMac({ title, message, groupId }, log, notificationState);
@@ -160,12 +203,12 @@ function sendDesktopNotificationMac({ title, message, groupId }, log, notificati
     child = spawn('terminal-notifier', args, { stdio: 'ignore' });
   } catch (err) {
     notificationState.desktopUnavailable = true;
-    log('error', `Failed to spawn terminal-notifier: ${err.message}`);
+    log('error', 'Failed to spawn terminal-notifier', errInfo(err));
     return Promise.resolve(null);
   }
   child.on('error', (err) => {
     notificationState.desktopUnavailable = true;
-    log('error', `terminal-notifier error: ${err.message}`);
+    log('error', 'terminal-notifier error', errInfo(err));
   });
   child.unref();
 
@@ -196,19 +239,19 @@ function sendDesktopNotificationWindows({ title, message }, log, notificationSta
     child = spawn('powershell', ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], { stdio: 'ignore' });
   } catch (err) {
     notificationState.desktopUnavailable = true;
-    log('error', `Failed to spawn powershell for toast notification: ${err.message}`);
+    log('error', 'Failed to spawn powershell for toast notification', errInfo(err));
     return Promise.resolve(null);
   }
   child.on('error', (err) => {
     notificationState.desktopUnavailable = true;
-    log('error', `powershell toast error: ${err.message}`);
+    log('error', 'powershell toast error', errInfo(err));
   });
   child.unref();
 
   return Promise.resolve({ platform: 'other', groupId: null });
 }
 
-function sendDesktopNotificationLinux({ title, message, urgency, onClickCommand, expireTimeoutMs }, log, notificationState) {
+function sendDesktopNotificationLinux({ title, message, urgency, onClickCommand, expireTimeoutMs }, log, notificationState, lifecycle) {
   const urgencyByte = urgency === 'critical' ? 2 : urgency === 'low' ? 0 : 1;
   const hintsArg = `{'urgency': <byte ${urgencyByte}>}`;
   const expireTimeoutArg = String(expireTimeoutMs ?? 0);
@@ -228,14 +271,14 @@ function sendDesktopNotificationLinux({ title, message, urgency, onClickCommand,
       child = spawn('gdbus', args, { stdio: ['ignore', 'pipe', 'pipe'] });
     } catch (err) {
       notificationState.desktopUnavailable = true;
-      log('error', `Failed to spawn gdbus: ${err.message}`);
+      log('error', 'Failed to spawn gdbus', errInfo(err));
       resolve(null);
       return;
     }
 
     child.on('error', (err) => {
       notificationState.desktopUnavailable = true;
-      log('error', `gdbus Notify failed: ${err.message}`);
+      log('error', 'gdbus Notify failed', errInfo(err));
       resolve(null);
     });
 
@@ -246,37 +289,38 @@ function sendDesktopNotificationLinux({ title, message, urgency, onClickCommand,
     child.stdout.on('close', () => {
       const match = stdout.match(/\(uint32 (\d+),\)/);
       if (!match) {
-        log('error', `gdbus Notify returned unexpected output: ${stdout.trim()}`);
+        log('error', 'gdbus Notify returned unexpected output', { bytes: stdout.length });
         resolve(null);
         return;
       }
       const id = Number(match[1]);
       resolve({ platform: 'linux', id });
 
-      if (onClickCommand) {
-        subscribeLinuxActionInvoked(id, onClickCommand, log);
+      if (onClickCommand && !lifecycle.disposed) {
+        subscribeLinuxActionInvoked(id, onClickCommand, log, lifecycle);
       }
     });
 
     child.stderr.on('data', (chunk) => {
-      log('error', `gdbus Notify stderr: ${chunk.toString().trim()}`);
+      log('error', 'gdbus Notify wrote to stderr', { bytes: chunk.length });
     });
   });
 }
 
-function subscribeLinuxActionInvoked(id, onClickCommand, log) {
+function subscribeLinuxActionInvoked(id, onClickCommand, log, lifecycle) {
   let monitor;
   try {
     monitor = spawn('gdbus', ['monitor', '--session', '--dest', DBUS_DEST, '--object-path', DBUS_PATH], {
       stdio: ['ignore', 'pipe', 'ignore'],
     });
   } catch (err) {
-    log('error', `Failed to spawn gdbus monitor: ${err.message}`);
+    log('error', 'Failed to spawn gdbus monitor', errInfo(err));
     return;
   }
+  lifecycle.monitors.add(monitor);
 
   monitor.on('error', (err) => {
-    log('error', `gdbus monitor error: ${err.message}`);
+    log('error', 'gdbus monitor error', errInfo(err));
   });
 
   let buffer = '';
@@ -290,7 +334,7 @@ function subscribeLinuxActionInvoked(id, onClickCommand, log) {
       if (actionMatch && Number(actionMatch[1]) === id && actionMatch[2] === 'default') {
         const cmd = onClickCommand.replaceAll('${NODE_PID}', String(process.pid));
         exec(cmd, (err) => {
-          if (err) log('error', `onClickCommand failed: ${err.message}`);
+          if (err) log('error', 'onClickCommand failed', errInfo(err));
         });
         monitor.kill();
         return;
@@ -305,6 +349,7 @@ function subscribeLinuxActionInvoked(id, onClickCommand, log) {
   });
 
   monitor.on('close', () => {
+    lifecycle.monitors.delete(monitor);
     monitor.unref();
   });
 }
@@ -318,11 +363,11 @@ function closeDesktopNotification(handle, log) {
     try {
       child = spawn('gdbus', args, { stdio: 'ignore' });
     } catch (err) {
-      log('error', `closeDesktopNotification failed to spawn gdbus: ${err.message}`);
+      log('error', 'closeDesktopNotification failed to spawn gdbus', errInfo(err));
       return;
     }
     child.on('error', (err) => {
-      log('error', `gdbus CloseNotification error: ${err.message}`);
+      log('error', 'gdbus CloseNotification error', errInfo(err));
     });
     child.unref();
     return;
@@ -334,11 +379,11 @@ function closeDesktopNotification(handle, log) {
     try {
       child = spawn('terminal-notifier', args, { stdio: 'ignore' });
     } catch (err) {
-      log('error', `closeDesktopNotification (macOS) failed to spawn terminal-notifier: ${err.message}`);
+      log('error', 'closeDesktopNotification (macOS) failed to spawn terminal-notifier', errInfo(err));
       return;
     }
     child.on('error', (err) => {
-      log('error', `terminal-notifier -remove error: ${err.message}`);
+      log('error', 'terminal-notifier -remove error', errInfo(err));
     });
     child.unref();
     return;
@@ -351,12 +396,12 @@ async function dispatchWebhooks(webhooks, payload, log) {
     const body = JSON.stringify(payload);
     const requests = webhooks.map(({ url, headers = {} }) =>
       fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body }).catch((err) => {
-        log('error', `Webhook POST to ${url} failed: ${err.message}`);
+        log('error', 'Webhook POST failed', { host: webhookHost(url), ...errInfo(err) });
       }),
     );
     await Promise.allSettled(requests);
   } catch (err) {
-    log('error', `Webhook dispatch failed: ${err.message}`);
+    log('error', 'Webhook dispatch failed', errInfo(err));
   }
 }
 
@@ -401,7 +446,7 @@ async function ringTerminalBell(log, notificationState) {
     await handle.write('\x07');
   } catch (err) {
     notificationState.bellUnavailable = true;
-    log('info', `Terminal bell unavailable (no controlling tty?): ${err.message}`);
+    log('info', 'Terminal bell unavailable (no controlling tty?)', errInfo(err));
     return;
   } finally {
     await handle?.close().catch(() => {});
@@ -442,7 +487,7 @@ async function fireFocusGatedNotification({
 }
 
 // ---------------------------------------------------------------------------
-// Focus detection (unchanged from V1)
+// Focus detection
 // ---------------------------------------------------------------------------
 
 async function collectLinuxAncestorPids(startPid) {
@@ -574,7 +619,7 @@ async function isOpencodeWindowFocused() {
 }
 
 // ---------------------------------------------------------------------------
-// createNotifier — the single runtime-agnostic entry point
+// createNotifier — the notifier entry point
 // ---------------------------------------------------------------------------
 
 /**
@@ -585,11 +630,13 @@ async function isOpencodeWindowFocused() {
  *   onClickCommand?: string;
  *   skipIfFocused?: boolean;
  *   notifications?: Record<string, unknown>;
- *   _todoConfiguredExplicitly?: boolean;
- * }} resolved  Already-merged config (file + inline options); see each adapter.
- * @param {{ log: (level: string, message: string, extra?: Record<string, unknown>) => void }} deps
+ * }} resolved  Already-merged config (file + plugin options).
+ * @param {{
+ *   log: (level: string, message: string, extra?: Record<string, unknown>) => void;
+ *   lookupSessionTitle?: (sessionID: string) => Promise<string | undefined>;
+ * }} deps  `lookupSessionTitle` resolves titles for sessions no title event was seen for.
  */
-export function createNotifier(resolved, { log }) {
+export function createNotifier(resolved, { log, lookupSessionTitle }) {
   const desktopEnabled = resolved.desktop ?? true;
   const webhooks = resolved.webhooks ?? [];
   const onClickCommand = resolved.onClickCommand;
@@ -608,10 +655,14 @@ export function createNotifier(resolved, { log }) {
     log('info', 'No graphical session detected (DISPLAY, WAYLAND_DISPLAY, and DBUS_SESSION_BUS_ADDRESS are all unset); desktop notifications disabled for this session.');
   }
 
+  /** Process-level resources owned by this notifier, released by `dispose()`. */
+  const lifecycle = { disposed: false, monitors: new Set(), timers: new Set() };
+
+  const send = (opts) => sendDesktopNotification(opts, log, notificationState, lifecycle);
+
   const notifCfg = resolved.notifications ?? {};
   const notifyTaskFinished = notifCfg.taskFinished ?? true;
   const notifyQuestionAsked = notifCfg.questionAsked ?? true;
-  const notifyTodoCompleted = notifCfg.todoCompleted ?? true;
   const notifySessionError = notifCfg.sessionError ?? true;
 
   const permissionCfg = resolveNotificationConfig(notifCfg.permissionRequested, {
@@ -623,21 +674,82 @@ export function createNotifier(resolved, { log }) {
 
   /** @type {Map<string, string>} sessionID -> title */
   const sessionTitleCache = new Map();
-  /** @type {Map<string, Map<string, string>>} sessionID -> (todoContent -> status) */
-  const todoStateCache = new Map();
-  /** @type {Map<string, unknown>} requestID -> NotificationHandle */
+  /** @type {Map<string, Promise<string>>} sessionID -> in-flight title lookup */
+  const titleLookups = new Map();
+  /** @type {Map<string, { handle: unknown, sessionID: string }>} requestID -> notification */
   const permissionNotifHandleCache = new Map();
   /** @type {Set<string>} requestIDs replied-to before their notify call resolved */
   const permissionRepliedEarlyCache = new Set();
-  /** @type {Map<string, unknown>} requestID -> NotificationHandle */
+  /** @type {Map<string, { handle: unknown, sessionID: string }>} requestID -> notification */
   const promptNotifHandleCache = new Map();
 
-  function resolveSessionTitle(sessionID) {
-    return sessionTitleCache.get(sessionID) ?? `Session ${sessionID.slice(0, 8)}`;
+  const fallbackTitle = (sessionID) => `Session ${String(sessionID ?? 'unknown').slice(0, 8)}`;
+
+  /** Returns the title without awaiting when it is known or cannot be looked up. */
+  function cachedTitle(sessionID) {
+    return sessionTitleCache.get(sessionID) ?? (lookupSessionTitle && sessionID ? undefined : fallbackTitle(sessionID));
+  }
+
+  function fetchTitle(sessionID) {
+    let pending = titleLookups.get(sessionID);
+    if (!pending) {
+      pending = (async () => {
+        let timer;
+        try {
+          const title = await Promise.race([
+            lookupSessionTitle(sessionID),
+            new Promise((resolve) => {
+              timer = setTimeout(resolve, TITLE_LOOKUP_TIMEOUT_MS, undefined);
+              timer.unref?.();
+            }),
+          ]);
+          return typeof title === 'string' && title ? title : fallbackTitle(sessionID);
+        } catch (err) {
+          log('warn', 'Session title lookup failed', errInfo(err));
+          return fallbackTitle(sessionID);
+        } finally {
+          clearTimeout(timer);
+        }
+      })().then((title) => {
+        // An eviction or dispose during the lookup removed this entry; the
+        // result must not repopulate the cache for a deleted session.
+        if (titleLookups.get(sessionID) === pending) {
+          titleLookups.delete(sessionID);
+          if (!lifecycle.disposed) sessionTitleCache.set(sessionID, title);
+        }
+        return title;
+      });
+      titleLookups.set(sessionID, pending);
+    }
+    return pending;
+  }
+
+  const resolveSessionTitle = async (sessionID) => cachedTitle(sessionID) ?? fetchTitle(sessionID);
+
+  function scheduleExpiry(requestID, entry) {
+    const timer = setTimeout(() => {
+      lifecycle.timers.delete(timer);
+      if (permissionNotifHandleCache.get(requestID) === entry) {
+        closeDesktopNotification(entry.handle, log);
+        permissionNotifHandleCache.delete(requestID);
+      }
+    }, permissionCfg.expireTimeoutMs);
+    timer.unref?.();
+    lifecycle.timers.add(timer);
+  }
+
+  function evictSession(sessionID) {
+    sessionTitleCache.delete(sessionID);
+    titleLookups.delete(sessionID);
+    for (const cache of [permissionNotifHandleCache, promptNotifHandleCache]) {
+      for (const [requestID, entry] of cache) {
+        if (entry.sessionID === sessionID) cache.delete(requestID);
+      }
+    }
   }
 
   /**
-   * @param {import('./normalized-event.js').NormalizedEvent} event
+   * @param {NormalizedEvent} event
    */
   async function handle(event) {
     switch (event.kind) {
@@ -648,40 +760,40 @@ export function createNotifier(resolved, { log }) {
         break;
       }
 
+      case 'session-deleted': {
+        if (event.sessionID) evictSession(event.sessionID);
+        break;
+      }
+
       case 'permission-asked': {
         if (!notifyPermissionRequested) break;
         const { sessionID, requestID, description } = event;
-        const sessionTitle = resolveSessionTitle(sessionID);
+        const sessionTitle = cachedTitle(sessionID) ?? (await fetchTitle(sessionID));
 
         if (desktopEnabled) {
           if (permissionNotifHandleCache.has(requestID)) {
-            closeDesktopNotification(permissionNotifHandleCache.get(requestID), log);
+            closeDesktopNotification(permissionNotifHandleCache.get(requestID).handle, log);
             permissionNotifHandleCache.delete(requestID);
           }
 
-          const notifHandle = await sendDesktopNotification({
+          const notifHandle = await send({
             title: 'opencode \u2013 Permission Request',
             message: `${description}\n${sessionTitle}`,
             urgency: permissionCfg.urgency,
             expireTimeoutMs: permissionCfg.expireTimeoutMs,
             groupId: requestID,
             onClickCommand,
-          }, log, notificationState);
+          });
 
           const repliedEarly = permissionRepliedEarlyCache.delete(requestID);
           if (notifHandle !== null) {
             if (repliedEarly) {
               closeDesktopNotification(notifHandle, log);
             } else {
-              permissionNotifHandleCache.set(requestID, notifHandle);
-              if (permissionCfg.expireTimeoutMs > 0) {
-                const timer = setTimeout(() => {
-                  if (permissionNotifHandleCache.get(requestID) === notifHandle) {
-                    closeDesktopNotification(notifHandle, log);
-                    permissionNotifHandleCache.delete(requestID);
-                  }
-                }, permissionCfg.expireTimeoutMs);
-                timer.unref?.();
+              const entry = { handle: notifHandle, sessionID };
+              permissionNotifHandleCache.set(requestID, entry);
+              if (permissionCfg.expireTimeoutMs > 0 && !lifecycle.disposed) {
+                scheduleExpiry(requestID, entry);
               }
             }
           }
@@ -707,7 +819,7 @@ export function createNotifier(resolved, { log }) {
       case 'permission-replied': {
         const { requestID } = event;
         if (permissionNotifHandleCache.has(requestID)) {
-          closeDesktopNotification(permissionNotifHandleCache.get(requestID), log);
+          closeDesktopNotification(permissionNotifHandleCache.get(requestID).handle, log);
           permissionNotifHandleCache.delete(requestID);
         } else if (desktopEnabled && notifyPermissionRequested) {
           permissionRepliedEarlyCache.add(requestID);
@@ -715,52 +827,16 @@ export function createNotifier(resolved, { log }) {
         break;
       }
 
-      case 'todos-updated': {
-        if (!notifyTodoCompleted) break;
-        const { sessionID, todos } = event;
-        const sessionTitle = resolveSessionTitle(sessionID);
-
-        let sessionTodos = todoStateCache.get(sessionID);
-        const isFirstSeen = !sessionTodos;
-        if (isFirstSeen) {
-          sessionTodos = new Map();
-          todoStateCache.set(sessionID, sessionTodos);
-        }
-
-        const skip = (desktopEnabled || terminalBellEnabled) && resolved.skipIfFocused !== false && (await isOpencodeWindowFocused());
-
-        for (const todo of todos) {
-          const prevStatus = sessionTodos.get(todo.content);
-          const isNewlyCompleted = !isFirstSeen && prevStatus !== 'completed' && todo.status === 'completed';
-
-          if (isNewlyCompleted) {
-            if (!skip) {
-              if (desktopEnabled) {
-                sendDesktopNotification({ title: 'opencode \u2013 Todo Done', message: `${todo.content}\n${sessionTitle}`, onClickCommand }, log, notificationState);
-              }
-              if (terminalBellEnabled) {
-                await ringTerminalBell(log, notificationState);
-              }
-            }
-            if (webhooks.length > 0) {
-              await dispatchWebhooks(webhooks, { event: 'todo_completed', sessionID, sessionTitle, todoContent: todo.content }, log);
-            }
-          }
-          sessionTodos.set(todo.content, todo.status);
-        }
-        break;
-      }
-
       case 'session-idle': {
         if (!notifyTaskFinished) break;
         const { sessionID } = event;
-        const sessionTitle = resolveSessionTitle(sessionID);
+        const sessionTitle = await resolveSessionTitle(sessionID);
 
         await fireFocusGatedNotification({
           desktopEnabled,
           terminalBellEnabled,
           skipIfFocused: resolved.skipIfFocused !== false,
-          sendDesktop: () => sendDesktopNotification({ title: 'opencode \u2013 Task Done', message: sessionTitle, onClickCommand }, log, notificationState),
+          sendDesktop: () => send({ title: 'opencode \u2013 Task Done', message: sessionTitle, onClickCommand }),
           log,
           notificationState,
         });
@@ -773,18 +849,18 @@ export function createNotifier(resolved, { log }) {
       case 'session-failed': {
         if (!notifySessionError) break;
         const { sessionID = 'unknown', errorMessage } = event;
-        const sessionTitle = resolveSessionTitle(sessionID);
+        const sessionTitle = await resolveSessionTitle(sessionID);
 
         await fireFocusGatedNotification({
           desktopEnabled,
           terminalBellEnabled,
           skipIfFocused: resolved.skipIfFocused !== false,
-          sendDesktop: () => sendDesktopNotification({
+          sendDesktop: () => send({
             title: 'opencode \u2013 Session Error',
             message: errorMessage ? `${sessionTitle}\n${errorMessage}` : sessionTitle,
             urgency: 'critical',
             onClickCommand,
-          }, log, notificationState),
+          }),
           log,
           notificationState,
         });
@@ -797,19 +873,19 @@ export function createNotifier(resolved, { log }) {
       case 'prompt-asked': {
         if (!notifyQuestionAsked) break;
         const { sessionID, requestID, title, body } = event;
-        const sessionTitle = resolveSessionTitle(sessionID);
+        const sessionTitle = await resolveSessionTitle(sessionID);
         const notifTitle = title ? `opencode \u2013 ${title}` : 'opencode \u2013 Question';
         const notifMessage = body ?? sessionTitle;
 
         if (desktopEnabled) {
           if (promptNotifHandleCache.has(requestID)) {
-            closeDesktopNotification(promptNotifHandleCache.get(requestID), log);
+            closeDesktopNotification(promptNotifHandleCache.get(requestID).handle, log);
             promptNotifHandleCache.delete(requestID);
           }
 
-          const notifHandle = await sendDesktopNotification({ title: notifTitle, message: notifMessage, onClickCommand }, log, notificationState);
+          const notifHandle = await send({ title: notifTitle, message: notifMessage, onClickCommand });
           if (notifHandle !== null) {
-            promptNotifHandleCache.set(requestID, notifHandle);
+            promptNotifHandleCache.set(requestID, { handle: notifHandle, sessionID });
           }
         }
 
@@ -827,7 +903,7 @@ export function createNotifier(resolved, { log }) {
 
       case 'prompt-resolved': {
         const { requestID } = event;
-        closeDesktopNotification(promptNotifHandleCache.get(requestID), log);
+        closeDesktopNotification(promptNotifHandleCache.get(requestID)?.handle, log);
         promptNotifHandleCache.delete(requestID);
         break;
       }
@@ -837,5 +913,17 @@ export function createNotifier(resolved, { log }) {
     }
   }
 
-  return { handle, notificationState };
+  /**
+   * Releases the processes and timers this notifier owns. Notifications
+   * already shown stay on screen; none is started afterwards. Idempotent.
+   */
+  function dispose() {
+    lifecycle.disposed = true;
+    for (const monitor of lifecycle.monitors) monitor.kill();
+    lifecycle.monitors.clear();
+    for (const timer of lifecycle.timers) clearTimeout(timer);
+    lifecycle.timers.clear();
+  }
+
+  return { handle, notificationState, dispose };
 }
