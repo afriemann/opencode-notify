@@ -1,31 +1,23 @@
 # opencode-notify
 
-opencode plugin that sends desktop notifications and optional webhook events when opencode finalizes a todo, requests a permission, finishes a session, encounters an error, or asks the user a question.
+opencode plugin that sends desktop notifications and optional webhook events when opencode requests a permission, finishes a session, encounters an error, or asks the user a question.
 
 ## Installation
 
-Both opencode V1 (`@opencode-ai/plugin`) and V2 (`@opencode/cli` /
-`@opencode/plugin`) are supported, via separate entrypoint files.
+Requires opencode V2 (`@opencode/plugin` ^2.0.21) and Node.js >= 22.5.
 
-**V1:** clone the repository to your `~/.config/opencode/plugins` directory and link `plugin.v1.js`:
+Clone the repository and load `src/plugin.v2.js`. To load it from a project's
+or the global `.opencode/plugins/` directory, place `src/plugin.v2.js` there
+and keep `src/core.js` and `src/normalize-v2.js` in a sibling `.opencode/lib/`
+directory (adjust the relative imports) -- `.opencode/plugins/` scans every
+`.js` file placed directly inside it as its own candidate plugin, so shared
+modules must never live alongside it.
 
-```bash
-git clone git@github.com:afriemann/opencode-notify ~/.config/opencode/plugins/opencode-notify
-cd ~/.config/opencode/plugins
-ln -s opencode-notify/src/plugin.v1.js opencode-notify.js
-```
-
-**V2:** drop `src/plugin.v2.js` into a project's or the global
-`.opencode/plugins/` directory, with `src/core.js` (and its own relative
-import path adjusted) in a sibling `.opencode/lib/` directory —
-`.opencode/plugins/` scans every `.js` file placed directly inside it as its
-own candidate plugin, so shared modules must never live alongside it.
-
-On V2, **todo-completion notifications never fire** — no such event exists
-on that runtime (see `docs/v2-compat-audit.md`) — and question/form
-notifications use a reduced-scope mapping (notification only, using the
-form's title; the user's typed answer is never included in any notification
-or webhook payload).
+Question/form notifications use the form's title only; the user's typed answer
+is never included in any notification or webhook payload. There is no todo
+event source on opencode V2, so todo-completion notifications do not exist;
+the `notifications.todoCompleted` key is accepted but ignored (a startup
+warning is logged when it is set).
 
 opencode will then automatically load the plugin on startup.
 
@@ -50,7 +42,7 @@ To configure options, create `~/.config/opencode/opencode-notify.json`:
 }
 ```
 
-The file is optional — omitting it uses the defaults listed in [Options](#options). If the plugin is installed as an npm package and loaded via the `"plugin"` key in `opencode.jsonc`, inline options passed there take precedence over the config file.
+The file is optional — omitting it uses the defaults listed in [Options](#options). Options passed in the plugin's `options` (`{package, options}` entry in `plugins` of `opencode.jsonc`) take precedence over the config file: each top-level key replaces the file's, except `notifications`, which merges per key.
 
 ## Options
 
@@ -67,19 +59,17 @@ The file is optional — omitting it uses the defaults listed in [Options](#opti
 
 | Key | Opencode event | Default | Description |
 |-----|----------------|---------|-------------|
-| `taskFinished` | `session.idle` | `true` | "Task Done" — fired when a session becomes idle |
-| `questionAsked` | `question.asked` | `true` | Question prompt — fired when opencode asks the user a question |
+| `taskFinished` | `session.execution.succeeded` | `true` | "Task Done" — fired when a session becomes idle |
+| `questionAsked` | `form.created` | `true` | Question prompt — fired when opencode asks the user a question |
 | `permissionRequested` | `permission.asked` | `true` | Permission request — fired when opencode needs user approval. Also accepts an object — see [Permission request options](#permission-request-options) |
-| `todoCompleted` | `todo.updated` | `true` | Todo done — fired when an individual todo transitions to `completed` |
-| `sessionError` | `session.error` | `true` | Session error — fired when a session encounters an error |
+| `sessionError` | `session.execution.failed` | `true` | Session error — fired when a session encounters an error |
 
-**Example** — disable "Task Done" and todo notifications:
+**Example** — disable "Task Done" notifications:
 
 ```json
 {
   "notifications": {
-    "taskFinished": false,
-    "todoCompleted": false
+    "taskFinished": false
   }
 }
 ```
@@ -117,7 +107,7 @@ The notification is still dismissed **immediately** the moment opencode actually
 
 When `skipIfFocused` is `true` (the default), the plugin suppresses desktop notifications if the opencode window is already focused — no point notifying you when you're already looking at it.
 
-> **Note:** `permission.asked` and `question.asked` always bypass focus suppression — permission requests and questions are always delivered to the user regardless of the `skipIfFocused` setting.
+> **Note:** `permission.asked` and `form.created` always bypass focus suppression — permission requests and questions are always delivered to the user regardless of the `skipIfFocused` setting.
 
 Focus is detected by obtaining the focused window's owner PID (via `xprop` querying `_NET_ACTIVE_WINDOW` / `_NET_WM_PID` on X11/XWayland, or compositor IPC on native Wayland) and then walking `/proc` upward from the opencode Node process — checking whether the focused window's PID appears in opencode's ancestor chain (opencode → shell → terminal emulator → display server).
 
@@ -136,7 +126,7 @@ To disable focus detection and always notify: set `skipIfFocused: false`.
 
 ## Terminal Bell
 
-When `terminalBell` is `true` (the default), the plugin rings the ASCII terminal bell (`\x07`) by writing directly to `/dev/tty` on every notification-worthy event — the same channels and focus-suppression rules as [Focus Detection](#focus-detection) apply (`permission.asked` and `question.asked` always ring the bell; the others respect `skipIfFocused`).
+When `terminalBell` is `true` (the default), the plugin rings the ASCII terminal bell (`\x07`) by writing directly to `/dev/tty` on every notification-worthy event — the same channels and focus-suppression rules as [Focus Detection](#focus-detection) apply (`permission.asked` and `form.created` always ring the bell; the others respect `skipIfFocused`).
 
 This is deliberately a **terminal-mediated, window-manager-agnostic** mechanism, distinct from the desktop-notification channel above: it writes to the controlling TTY device rather than `process.stdout` (writing to this plugin's own stdout would interleave with, or be swallowed by, opencode's own TUI rendering), and it needs no `DISPLAY`/`WAYLAND_DISPLAY`/D-Bus session — so it also works over SSH.
 
@@ -156,7 +146,6 @@ On Linux, every desktop notification includes a **"Focus opencode"** action butt
 Notifications are sent via `gdbus call … org.freedesktop.Notifications.Notify` directly — no dependency on `notify-send`. `gdbus` is part of GLib (`glib2` / `libglib2.0-bin`), which is present on virtually every Linux desktop.
 
 - **Permission notifications** use `urgency=critical` by default with no auto-dismiss timer (configurable — see [Permission request options](#permission-request-options)). The notification is dismissed immediately once opencode actually replies to the request — whether that's a near-instant allow-all-mode reply or a manual approve/deny click — rather than requiring a manual dismissal or an artificial timeout.
-- **Todo notifications** use default urgency.
 - If `onClickCommand` is set and non-empty, it is executed via `child_process.exec` when the user clicks the action. If `onClickCommand` is absent or empty the click is a no-op (the action button is still shown but does nothing beyond dismissing the notification).
 
 ### Example — Hyprland v0.55+
@@ -164,10 +153,13 @@ Notifications are sent via `gdbus call … org.freedesktop.Notifications.Notify`
 Hyprland v0.55 introduced `hl.dsp.focus({ window })` via `hyprctl eval`. To focus the opencode window by PID, set `onClickCommand` in your `opencode.jsonc`:
 
 ```jsonc
-["path/to/opencode-notify/src/plugin.v1.js", {
-  "desktop": true,
-  "onClickCommand": "hyprctl eval \"hl.dsp.focus({ window = 'pid:${NODE_PID}' })\""
-}]
+{
+  "package": "opencode-notify",
+  "options": {
+    "desktop": true,
+    "onClickCommand": "hyprctl eval \"hl.dsp.focus({ window = 'pid:${NODE_PID}' })\""
+  }
+}
 ```
 
 The plugin substitutes `${NODE_PID}` with `process.pid` at the moment the notification action fires, so the running opencode process is targeted correctly. `${NODE_PID}` is a placeholder in the config string — the plugin never passes it literally to the shell.
@@ -181,14 +173,11 @@ The plugin substitutes `${NODE_PID}` with `process.pid` at the moment the notifi
 
 ## Webhook Payload
 
-The plugin POSTs a JSON body to each configured webhook URL. Five event shapes are emitted:
+The plugin POSTs a JSON body to each configured webhook URL. Four event shapes are emitted:
 
 ```json
 // permission_request
 { "event": "permission_request", "sessionID": "ses_...", "sessionTitle": "Fix the login bug", "permissionTitle": "Run bash: rm -rf dist/" }
-
-// todo_completed
-{ "event": "todo_completed", "sessionID": "ses_...", "sessionTitle": "Fix the login bug", "todoContent": "Implement the fix" }
 
 // session_idle
 { "event": "session_idle", "sessionID": "ses_...", "sessionTitle": "Fix the login bug" }
@@ -205,8 +194,8 @@ The plugin POSTs a JSON body to each configured webhook URL. Five event shapes a
 The plugin handles the following opencode events. Each notifying event can be individually disabled via the [`notifications` option](#per-event-toggles-notifications-object).
 
 - **`permission.asked`** — fired when opencode raises a permission request that requires user approval. Triggers a `permission_request` notification. Focus suppression is always bypassed so permission requests always reach the user. Disable with `notifications.permissionRequested: false`.
+- **`session.created`, `session.renamed`, `session.deleted`** — keep the session-title cache current; a title not seen in an event is looked up once through the host. No notification is sent.
 - **`permission.replied`** — fired when a permission request is answered (approved or rejected). The corresponding `permission_request` notification is programmatically dismissed.
-- **`todo.updated`** — fired when a todo transitions to `completed`. Triggers a `todo_completed` notification. Disable with `notifications.todoCompleted: false`.
-- **`session.idle`** — fired when a session finishes and the agent becomes idle. Triggers a `session_idle` notification ("Task Done"). Disable with `notifications.taskFinished: false`.
-- **`session.error`** — fired when a session encounters an error. Triggers a `session_error` notification ("Session Error"). Disable with `notifications.sessionError: false`.
-- **`question.asked`** — fired when opencode asks the user a question. Triggers a `question_asked` notification. Focus suppression is **always bypassed** for this event so questions always reach the user. Disable with `notifications.questionAsked: false`.
+- **`session.execution.succeeded`** — fired when a session finishes successfully. Triggers a `session_idle` notification ("Task Done"). Disable with `notifications.taskFinished: false`.
+- **`session.execution.failed`** — fired when a session execution fails. Triggers a `session_error` notification ("Session Error"). Disable with `notifications.sessionError: false`.
+- **`form.created`** — fired when opencode asks the user a question. `form.replied` and `form.cancelled` dismiss the notification. Triggers a `question_asked` notification. Focus suppression is **always bypassed** for this event so questions always reach the user. Disable with `notifications.questionAsked: false`.

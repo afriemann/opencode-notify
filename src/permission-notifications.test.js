@@ -38,11 +38,23 @@ jest.unstable_mockModule('node:child_process', () => ({
   exec: jest.fn(),
 }));
 
-let opencodeNotify;
+let createNotifier;
+let normalizeV2Event;
 
 beforeAll(async () => {
-  ({ default: opencodeNotify } = await import('./plugin.v1.js'));
+  ({ createNotifier } = await import('./core.js'));
+  ({ normalizeV2Event } = await import('./normalize-v2.js'));
 });
+
+/**
+ * Builds a notifier and returns a function that feeds it raw V2 events. The
+ * handler's synchronous portion (including `spawn`) runs before the returned
+ * promise is awaited, which the early-reply race test relies on.
+ */
+function startNotifier(options) {
+  const notifier = createNotifier(options, { log: jest.fn() });
+  return (rawEvent) => notifier.handle(normalizeV2Event(rawEvent)[0]);
+}
 
 /** Resolves the given fake Notify child with the given numeric notification id. */
 function resolveNotify(notifyEntry, id) {
@@ -53,7 +65,6 @@ function resolveNotify(notifyEntry, id) {
 describe('permission notification desktop behaviour (Linux)', () => {
   const originalPlatform = process.platform;
   const originalDisplay = process.env.DISPLAY;
-  const client = { app: { log: jest.fn().mockResolvedValue(undefined) } };
 
   beforeEach(() => {
     Object.defineProperty(process, 'platform', { value: 'linux' });
@@ -70,13 +81,11 @@ describe('permission notification desktop behaviour (Linux)', () => {
   });
 
   it('sends permission requests with critical urgency and no auto-dismiss timeout by default', async () => {
-    const hooks = await opencodeNotify({ client }, { terminalBell: false });
+    const send = startNotifier({ terminalBell: false });
 
-    const asked = hooks.event({
-      event: {
-        type: 'permission.asked',
-        properties: { id: 'req-1', sessionID: 'sess-1', permission: 'bash' },
-      },
+    const asked = send({
+      type: 'permission.asked',
+      data: { id: 'req-1', sessionID: 'sess-1', action: 'bash', resources: [] },
     });
 
     expect(notifyCalls).toHaveLength(1);
@@ -92,16 +101,11 @@ describe('permission notification desktop behaviour (Linux)', () => {
   });
 
   it('honors a configured urgency and expireTimeoutMs override', async () => {
-    const hooks = await opencodeNotify(
-      { client },
-      { terminalBell: false, notifications: { permissionRequested: { urgency: 'normal', expireTimeoutMs: 5000 } } },
-    );
+    const send = startNotifier({ terminalBell: false, notifications: { permissionRequested: { urgency: 'normal', expireTimeoutMs: 5000 } } });
 
-    const asked = hooks.event({
-      event: {
-        type: 'permission.asked',
-        properties: { id: 'req-2', sessionID: 'sess-1', permission: 'bash' },
-      },
+    const asked = send({
+      type: 'permission.asked',
+      data: { id: 'req-2', sessionID: 'sess-1', action: 'bash', resources: [] },
     });
 
     resolveNotify(notifyCalls[0], 2);
@@ -114,22 +118,20 @@ describe('permission notification desktop behaviour (Linux)', () => {
   });
 
   it('closes the notification immediately if the reply races ahead of the async notify call', async () => {
-    const hooks = await opencodeNotify({ client }, { terminalBell: false });
+    const send = startNotifier({ terminalBell: false });
 
-    // Do NOT await yet — the handler suspends at `await sendDesktopNotification`,
+    // Do NOT await yet — the handler suspends at `await send`,
     // but the synchronous portion (including the `spawn` call) has already run.
-    const asked = hooks.event({
-      event: {
-        type: 'permission.asked',
-        properties: { id: 'req-3', sessionID: 'sess-1', permission: 'bash' },
-      },
+    const asked = send({
+      type: 'permission.asked',
+      data: { id: 'req-3', sessionID: 'sess-1', action: 'bash', resources: [] },
     });
     expect(notifyCalls).toHaveLength(1);
 
     // The reply arrives before the notify call has resolved — this is the
     // race that occurs with opencode's "auto"/allow-all permission mode,
     // which replies near-instantly.
-    await hooks.event({ event: { type: 'permission.replied', properties: { requestID: 'req-3' } } });
+    await send({ type: 'permission.replied', data: { requestID: 'req-3' } });
     expect(closeCalls).toHaveLength(0); // nothing to close yet — no handle cached
 
     resolveNotify(notifyCalls[0], 3);
@@ -141,16 +143,11 @@ describe('permission notification desktop behaviour (Linux)', () => {
 
   it('auto-dismisses the notification after expireTimeoutMs if never replied to', async () => {
     jest.useFakeTimers();
-    const hooks = await opencodeNotify(
-      { client },
-      { terminalBell: false, notifications: { permissionRequested: { expireTimeoutMs: 5000 } } },
-    );
+    const send = startNotifier({ terminalBell: false, notifications: { permissionRequested: { expireTimeoutMs: 5000 } } });
 
-    const asked = hooks.event({
-      event: {
-        type: 'permission.asked',
-        properties: { id: 'req-4', sessionID: 'sess-1', permission: 'bash' },
-      },
+    const asked = send({
+      type: 'permission.asked',
+      data: { id: 'req-4', sessionID: 'sess-1', action: 'bash', resources: [] },
     });
     resolveNotify(notifyCalls[0], 4);
     await asked;
@@ -165,16 +162,11 @@ describe('permission notification desktop behaviour (Linux)', () => {
 
   it('does not auto-dismiss when expireTimeoutMs is 0', async () => {
     jest.useFakeTimers();
-    const hooks = await opencodeNotify(
-      { client },
-      { terminalBell: false, notifications: { permissionRequested: { expireTimeoutMs: 0 } } },
-    );
+    const send = startNotifier({ terminalBell: false, notifications: { permissionRequested: { expireTimeoutMs: 0 } } });
 
-    const asked = hooks.event({
-      event: {
-        type: 'permission.asked',
-        properties: { id: 'req-5', sessionID: 'sess-1', permission: 'bash' },
-      },
+    const asked = send({
+      type: 'permission.asked',
+      data: { id: 'req-5', sessionID: 'sess-1', action: 'bash', resources: [] },
     });
     resolveNotify(notifyCalls[0], 5);
     await asked;
@@ -189,11 +181,9 @@ describe('permission notification desktop behaviour (Linux)', () => {
     // `permission.replied` must not record one either, or it would
     // accumulate for the lifetime of the process with no consumer.
     const addSpy = jest.spyOn(Set.prototype, 'add');
-    const hooks = await opencodeNotify({ client }, { desktop: false });
+    const send = startNotifier({ desktop: false });
 
-    await hooks.event({
-      event: { type: 'permission.replied', properties: { requestID: 'req-6' } },
-    });
+    await send({ type: 'permission.replied', data: { requestID: 'req-6' } });
 
     expect(addSpy).not.toHaveBeenCalledWith('req-6');
     addSpy.mockRestore();
@@ -201,11 +191,9 @@ describe('permission notification desktop behaviour (Linux)', () => {
 
   it('does not remember an early reply when permission notifications are disabled entirely (no unbounded leak)', async () => {
     const addSpy = jest.spyOn(Set.prototype, 'add');
-    const hooks = await opencodeNotify({ client }, { notifications: { permissionRequested: false } });
+    const send = startNotifier({ notifications: { permissionRequested: false } });
 
-    await hooks.event({
-      event: { type: 'permission.replied', properties: { requestID: 'req-7' } },
-    });
+    await send({ type: 'permission.replied', data: { requestID: 'req-7' } });
 
     expect(addSpy).not.toHaveBeenCalledWith('req-7');
     addSpy.mockRestore();

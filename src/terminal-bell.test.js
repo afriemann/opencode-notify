@@ -59,24 +59,40 @@ jest.unstable_mockModule('node:fs/promises', () => ({
   open: openMock,
 }));
 
-let opencodeNotify;
+let createNotifier;
+let normalizeV2Event;
 
 beforeAll(async () => {
-  ({ default: opencodeNotify } = await import('./plugin.v1.js'));
+  ({ createNotifier } = await import('./core.js'));
+  ({ normalizeV2Event } = await import('./normalize-v2.js'));
 });
+
+const log = jest.fn();
+
+/** Builds a notifier and returns a function that feeds it raw V2 events. */
+function startNotifier(options) {
+  const notifier = createNotifier(options, { log });
+  return (rawEvent) => notifier.handle(normalizeV2Event(rawEvent)[0]);
+}
+
+const permissionAsked = (id) => ({
+  type: 'permission.asked',
+  data: { id, sessionID: 'sess-1', action: 'bash', resources: [] },
+});
+const executionSucceeded = { type: 'session.execution.succeeded', data: { sessionID: 'sess-1' } };
+const executionFailed = { type: 'session.execution.failed', data: { sessionID: 'sess-1' } };
 
 describe('terminal bell (ring on notification-worthy events)', () => {
   const originalPlatform = process.platform;
   const originalDisplay = process.env.DISPLAY;
   const originalWaylandDisplay = process.env.WAYLAND_DISPLAY;
   const originalHyprlandSig = process.env.HYPRLAND_INSTANCE_SIGNATURE;
-  const client = { app: { log: jest.fn().mockResolvedValue(undefined) } };
 
   beforeEach(() => {
     Object.defineProperty(process, 'platform', { value: 'linux' });
     spawnMock.mockClear();
     openMock.mockReset();
-    client.app.log.mockClear();
+    log.mockClear();
     hyprctlFocusedPid = undefined;
   });
 
@@ -91,10 +107,8 @@ describe('terminal bell (ring on notification-worthy events)', () => {
     const handle = createFakeHandle();
     openMock.mockResolvedValue(handle);
 
-    const hooks = await opencodeNotify({ client }, { desktop: false });
-    await hooks.event({
-      event: { type: 'permission.asked', properties: { id: 'req-1', sessionID: 'sess-1', permission: 'bash' } },
-    });
+    const send = startNotifier({ desktop: false });
+    await send(permissionAsked('req-1'));
 
     expect(openMock).toHaveBeenCalledWith('/dev/tty', 'w');
     expect(handle.write).toHaveBeenCalledWith('\x07');
@@ -105,12 +119,10 @@ describe('terminal bell (ring on notification-worthy events)', () => {
     const handle = createFakeHandle();
     openMock.mockResolvedValue(handle);
 
-    const hooks = await opencodeNotify({ client }, { desktop: false });
-    await hooks.event({
-      event: {
-        type: 'question.asked',
-        properties: { id: 'q-1', sessionID: 'sess-1', questions: [{ header: 'Pick one', question: 'A or B?' }] },
-      },
+    const send = startNotifier({ desktop: false });
+    await send({
+      type: 'form.created',
+      data: { form: { id: 'q-1', sessionID: 'sess-1', title: 'Pick one', fields: [{ title: 'A or B?' }] } },
     });
 
     expect(handle.write).toHaveBeenCalledWith('\x07');
@@ -120,8 +132,8 @@ describe('terminal bell (ring on notification-worthy events)', () => {
     const handle = createFakeHandle();
     openMock.mockResolvedValue(handle);
 
-    const hooks = await opencodeNotify({ client }, { desktop: false, skipIfFocused: false });
-    await hooks.event({ event: { type: 'session.idle', properties: { sessionID: 'sess-1' } } });
+    const send = startNotifier({ desktop: false, skipIfFocused: false });
+    await send(executionSucceeded);
 
     expect(handle.write).toHaveBeenCalledWith('\x07');
   });
@@ -130,29 +142,8 @@ describe('terminal bell (ring on notification-worthy events)', () => {
     const handle = createFakeHandle();
     openMock.mockResolvedValue(handle);
 
-    const hooks = await opencodeNotify({ client }, { desktop: false, skipIfFocused: false });
-    await hooks.event({ event: { type: 'session.error', properties: { sessionID: 'sess-1' } } });
-
-    expect(handle.write).toHaveBeenCalledWith('\x07');
-  });
-
-  it('rings the terminal bell when a todo completes (skipIfFocused disabled)', async () => {
-    const handle = createFakeHandle();
-    openMock.mockResolvedValue(handle);
-
-    const hooks = await opencodeNotify({ client }, { desktop: false, skipIfFocused: false });
-    const sessionID = 'sess-1';
-
-    // First sighting establishes the baseline (no notification for pre-existing state).
-    await hooks.event({
-      event: { type: 'todo.updated', properties: { sessionID, todos: [{ content: 'Task A', status: 'pending' }] } },
-    });
-    expect(handle.write).not.toHaveBeenCalled();
-
-    // Transition to completed fires the bell.
-    await hooks.event({
-      event: { type: 'todo.updated', properties: { sessionID, todos: [{ content: 'Task A', status: 'completed' }] } },
-    });
+    const send = startNotifier({ desktop: false, skipIfFocused: false });
+    await send(executionFailed);
 
     expect(handle.write).toHaveBeenCalledWith('\x07');
   });
@@ -161,10 +152,8 @@ describe('terminal bell (ring on notification-worthy events)', () => {
     const handle = createFakeHandle();
     openMock.mockResolvedValue(handle);
 
-    const hooks = await opencodeNotify({ client }, { desktop: false, terminalBell: false });
-    await hooks.event({
-      event: { type: 'permission.asked', properties: { id: 'req-1', sessionID: 'sess-1', permission: 'bash' } },
-    });
+    const send = startNotifier({ desktop: false, terminalBell: false });
+    await send(permissionAsked('req-1'));
 
     expect(openMock).not.toHaveBeenCalled();
   });
@@ -174,10 +163,8 @@ describe('terminal bell (ring on notification-worthy events)', () => {
     const handle = createFakeHandle();
     openMock.mockResolvedValue(handle);
 
-    const hooks = await opencodeNotify({ client }, { desktop: false });
-    await hooks.event({
-      event: { type: 'permission.asked', properties: { id: 'req-1', sessionID: 'sess-1', permission: 'bash' } },
-    });
+    const send = startNotifier({ desktop: false });
+    await send(permissionAsked('req-1'));
 
     expect(openMock).not.toHaveBeenCalled();
   });
@@ -185,17 +172,13 @@ describe('terminal bell (ring on notification-worthy events)', () => {
   it('logs once and stops retrying when /dev/tty cannot be opened', async () => {
     openMock.mockRejectedValue(Object.assign(new Error('no such device or address'), { code: 'ENXIO' }));
 
-    const hooks = await opencodeNotify({ client }, { desktop: false });
+    const send = startNotifier({ desktop: false });
 
-    await hooks.event({
-      event: { type: 'permission.asked', properties: { id: 'req-1', sessionID: 'sess-1', permission: 'bash' } },
-    });
-    await hooks.event({
-      event: { type: 'permission.asked', properties: { id: 'req-2', sessionID: 'sess-1', permission: 'bash' } },
-    });
+    await send(permissionAsked('req-1'));
+    await send(permissionAsked('req-2'));
 
     expect(openMock).toHaveBeenCalledTimes(1);
-    expect(client.app.log).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledTimes(1);
   });
 
   describe('focus suppression (skipIfFocused default true)', () => {
@@ -212,8 +195,8 @@ describe('terminal bell (ring on notification-worthy events)', () => {
       const handle = createFakeHandle();
       openMock.mockResolvedValue(handle);
 
-      const hooks = await opencodeNotify({ client }, { desktop: false });
-      await hooks.event({ event: { type: 'session.idle', properties: { sessionID: 'sess-1' } } });
+      const send = startNotifier({ desktop: false });
+      await send(executionSucceeded);
 
       expect(openMock).not.toHaveBeenCalled();
     });
@@ -223,19 +206,19 @@ describe('terminal bell (ring on notification-worthy events)', () => {
       const handle = createFakeHandle();
       openMock.mockResolvedValue(handle);
 
-      const hooks = await opencodeNotify({ client }, { desktop: false });
-      await hooks.event({ event: { type: 'session.idle', properties: { sessionID: 'sess-1' } } });
+      const send = startNotifier({ desktop: false });
+      await send(executionSucceeded);
 
       expect(handle.write).toHaveBeenCalledWith('\x07');
     });
 
-    it('also suppresses the bell on session.error when focused (shared fireFocusGatedNotification helper)', async () => {
+    it('also suppresses the bell on session.execution.failed when focused (shared fireFocusGatedNotification helper)', async () => {
       hyprctlFocusedPid = process.pid;
       const handle = createFakeHandle();
       openMock.mockResolvedValue(handle);
 
-      const hooks = await opencodeNotify({ client }, { desktop: false });
-      await hooks.event({ event: { type: 'session.error', properties: { sessionID: 'sess-1' } } });
+      const send = startNotifier({ desktop: false });
+      await send(executionFailed);
 
       expect(openMock).not.toHaveBeenCalled();
     });

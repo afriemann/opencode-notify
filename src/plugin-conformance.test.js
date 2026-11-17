@@ -1,86 +1,90 @@
 import { jest } from '@jest/globals';
-import { SUPPORTED_KINDS } from './core.js';
-import { PRODUCIBLE_KINDS as V1_KINDS, normalizeV1Event } from './normalize-v1.js';
-import PluginV2, { PRODUCIBLE_KINDS as V2_KINDS, normalizeV2Event } from './plugin.v2.js';
 
-// spec: openspec/changes/fix-v1-loader-named-export-crash/specs/plugin/spec.md
-describe('module export surface (opencode V1 legacy-plugin loader safety)', () => {
-  it('plugin.v1.js exports only default -- no named export reachable', async () => {
-    const mod = await import('./plugin.v1.js');
-    expect(Object.keys(mod)).toEqual(['default']);
+let SUPPORTED_KINDS;
+let PluginV2;
+let pluginModule;
+let PRODUCIBLE_KINDS;
+let SUBSCRIBED_EVENT_TYPES;
+let normalizeV2Event;
+
+beforeAll(async () => {
+  // The developer's real per-user config file must never influence these
+  // tests: report it as absent and pass every other read through.
+  const actualFs = await import('node:fs/promises');
+  jest.unstable_mockModule('node:fs/promises', () => ({
+    ...actualFs,
+    readFile: (path, ...rest) => (
+      String(path).endsWith('opencode-notify.json')
+        ? Promise.reject(Object.assign(new Error('ENOENT'), { code: 'ENOENT' }))
+        : actualFs.readFile(path, ...rest)
+    ),
+  }));
+  ({ SUPPORTED_KINDS } = await import('./core.js'));
+  ({ PRODUCIBLE_KINDS, SUBSCRIBED_EVENT_TYPES, normalizeV2Event } = await import('./normalize-v2.js'));
+  pluginModule = await import('./plugin.v2.js');
+  PluginV2 = pluginModule.default;
+});
+
+// spec: openspec/specs/plugin/spec.md
+describe('module export surface', () => {
+  it('plugin.v2.js exports only default', () => {
+    expect(Object.keys(pluginModule)).toEqual(['default']);
+  });
+
+  // spec: openspec/specs/plugin/spec.md
+  it('The package main entry resolves to the V2 plugin', async () => {
+    const { readFile } = await import('node:fs/promises');
+    const pkg = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
+    expect(pkg.main).toBe('src/plugin.v2.js');
+    expect(pkg.exports['.']).toBe('./src/plugin.v2.js');
+    expect(pkg.exports['./v1']).toBeUndefined();
+  });
+
+  it('the default export is a plugin definition with a stable id', () => {
+    expect(PluginV2.id).toBe('opencode-notify');
+    expect(typeof PluginV2.setup).toBe('function');
   });
 });
 
 describe('kind-subset cross-check (design.md)', () => {
-  it('every kind either adapter can produce is one core.js handles', () => {
-    for (const kind of V1_KINDS) {
-      expect(SUPPORTED_KINDS).toContain(kind);
-    }
-    for (const kind of V2_KINDS) {
+  it('every kind the adapter can produce is one core.js handles', () => {
+    for (const kind of PRODUCIBLE_KINDS) {
       expect(SUPPORTED_KINDS).toContain(kind);
     }
   });
 
-  it('V2 deliberately cannot produce todos-updated (no V2 todo event source exists)', () => {
-    expect(V2_KINDS).not.toContain('todos-updated');
-    expect(V1_KINDS).toContain('todos-updated');
+  it('the todo kind no longer exists', () => {
+    expect(SUPPORTED_KINDS).not.toContain('todos-updated');
   });
 });
 
-describe('Tier 2 — V1 adapter normalization', () => {
-  it('session.created/session.updated -> session-titled', () => {
-    expect(normalizeV1Event({ type: 'session.created', properties: { info: { id: 's1', title: 'My Session' } } }))
-      .toEqual([{ kind: 'session-titled', sessionID: 's1', title: 'My Session' }]);
-    expect(normalizeV1Event({ type: 'session.updated', properties: { info: { id: 's1', title: 'Renamed' } } }))
-      .toEqual([{ kind: 'session-titled', sessionID: 's1', title: 'Renamed' }]);
+const CANNED_EVENTS = {
+  'session.created': { type: 'session.created', durable: { aggregateID: 's1' }, data: { title: 'T' } },
+  'session.renamed': { type: 'session.renamed', data: { sessionID: 's1', title: 'T' } },
+  'session.deleted': { type: 'session.deleted', data: { sessionID: 's1' } },
+  'session.execution.succeeded': { type: 'session.execution.succeeded', data: { sessionID: 's1' } },
+  'session.execution.failed': { type: 'session.execution.failed', data: { sessionID: 's1' } },
+  'permission.asked': { type: 'permission.asked', data: { sessionID: 's1', id: 'r1', action: 'read', resources: [] } },
+  'permission.replied': { type: 'permission.replied', data: { requestID: 'r1' } },
+  'form.created': { type: 'form.created', data: { form: { id: 'r1', sessionID: 's1', title: 'T', fields: [] } } },
+  'form.replied': { type: 'form.replied', data: { id: 'r1' } },
+  'form.cancelled': { type: 'form.cancelled', data: { id: 'r1' } },
+};
+
+describe('subscription filter', () => {
+  it('lists exactly the event types the normalizer maps', () => {
+    expect([...SUBSCRIBED_EVENT_TYPES].sort()).toEqual(Object.keys(CANNED_EVENTS).sort());
+    for (const type of SUBSCRIBED_EVENT_TYPES) {
+      expect(normalizeV2Event(CANNED_EVENTS[type]).length).toBeGreaterThan(0);
+    }
   });
 
-  it('permission.asked -> permission-asked, using the raw permission string verbatim', () => {
-    expect(normalizeV1Event({ type: 'permission.asked', properties: { id: 'req-1', sessionID: 's1', permission: 'bash' } }))
-      .toEqual([{ kind: 'permission-asked', sessionID: 's1', requestID: 'req-1', description: 'bash' }]);
-  });
-
-  it('permission.replied -> permission-replied', () => {
-    expect(normalizeV1Event({ type: 'permission.replied', properties: { requestID: 'req-1' } }))
-      .toEqual([{ kind: 'permission-replied', requestID: 'req-1' }]);
-  });
-
-  it('todo.updated -> todos-updated, passing the todos array through unchanged', () => {
-    const todos = [{ content: 'a', status: 'completed' }];
-    expect(normalizeV1Event({ type: 'todo.updated', properties: { sessionID: 's1', todos } }))
-      .toEqual([{ kind: 'todos-updated', sessionID: 's1', todos }]);
-  });
-
-  it('session.idle -> session-idle', () => {
-    expect(normalizeV1Event({ type: 'session.idle', properties: { sessionID: 's1' } }))
-      .toEqual([{ kind: 'session-idle', sessionID: 's1' }]);
-  });
-
-  it('session.error -> session-failed, with no errorMessage (V1 never carried one)', () => {
-    expect(normalizeV1Event({ type: 'session.error', properties: { sessionID: 's1' } }))
-      .toEqual([{ kind: 'session-failed', sessionID: 's1' }]);
-  });
-
-  it('question.asked -> prompt-asked, using the first question header/question', () => {
-    expect(normalizeV1Event({
-      type: 'question.asked',
-      properties: { id: 'req-1', sessionID: 's1', questions: [{ header: 'Pick one', question: 'A or B?' }] },
-    })).toEqual([{ kind: 'prompt-asked', sessionID: 's1', requestID: 'req-1', title: 'Pick one', body: 'A or B?' }]);
-  });
-
-  it('question.replied / question.rejected -> prompt-resolved', () => {
-    expect(normalizeV1Event({ type: 'question.replied', properties: { requestID: 'req-1' } }))
-      .toEqual([{ kind: 'prompt-resolved', requestID: 'req-1' }]);
-    expect(normalizeV1Event({ type: 'question.rejected', properties: { requestID: 'req-1' } }))
-      .toEqual([{ kind: 'prompt-resolved', requestID: 'req-1' }]);
-  });
-
-  it('unrecognized event types produce nothing', () => {
-    expect(normalizeV1Event({ type: 'something.unknown', properties: {} })).toEqual([]);
+  it('does not include events V2 never publishes', () => {
+    expect(SUBSCRIBED_EVENT_TYPES).not.toContain('session.idle');
   });
 });
 
-describe('Tier 2 — V2 adapter normalization', () => {
+describe('V2 adapter normalization', () => {
   it('session.created with a title -> session-titled, sessionID from durable.aggregateID', () => {
     expect(normalizeV2Event({ type: 'session.created', durable: { aggregateID: 's1' }, data: { title: 'My Session' } }))
       .toEqual([{ kind: 'session-titled', sessionID: 's1', title: 'My Session' }]);
@@ -93,6 +97,13 @@ describe('Tier 2 — V2 adapter normalization', () => {
   it('session.renamed -> session-titled (V2 has no session.updated)', () => {
     expect(normalizeV2Event({ type: 'session.renamed', data: { sessionID: 's1', title: 'Renamed' } }))
       .toEqual([{ kind: 'session-titled', sessionID: 's1', title: 'Renamed' }]);
+  });
+
+  it('session.deleted -> session-deleted, with the session ID from data or durable.aggregateID', () => {
+    expect(normalizeV2Event({ type: 'session.deleted', data: { sessionID: 's1' } }))
+      .toEqual([{ kind: 'session-deleted', sessionID: 's1' }]);
+    expect(normalizeV2Event({ type: 'session.deleted', durable: { aggregateID: 's2' }, data: {} }))
+      .toEqual([{ kind: 'session-deleted', sessionID: 's2' }]);
   });
 
   it('permission.asked composes description from action + resources', () => {
@@ -114,9 +125,13 @@ describe('Tier 2 — V2 adapter normalization', () => {
       .toEqual([{ kind: 'permission-replied', requestID: 'req-1' }]);
   });
 
-  it('session.idle -> session-idle', () => {
-    expect(normalizeV2Event({ type: 'session.idle', data: { sessionID: 's1' } }))
+  it('session.execution.succeeded -> session-idle', () => {
+    expect(normalizeV2Event({ type: 'session.execution.succeeded', data: { sessionID: 's1' } }))
       .toEqual([{ kind: 'session-idle', sessionID: 's1' }]);
+  });
+
+  it('session.idle is never published on V2 and is not mapped', () => {
+    expect(normalizeV2Event({ type: 'session.idle', data: { sessionID: 's1' } })).toEqual([]);
   });
 
   it('session.execution.failed -> session-failed, carrying error.message', () => {
@@ -146,98 +161,182 @@ describe('Tier 2 — V2 adapter normalization', () => {
   });
 });
 
-describe('Tier 3 — V2 lifecycle', () => {
-  function makeFakeCtx(events) {
+describe('V2 lifecycle', () => {
+  function makeFakeCtx(events = [], extra = {}) {
     let resolveNext;
     const queue = [...events];
-    const iterator = {
-      [Symbol.asyncIterator]() {
-        return {
-          next() {
-            return new Promise((resolve) => {
-              if (queue.length > 0) {
-                resolve({ done: false, value: queue.shift() });
-                return;
-              }
-              resolveNext = resolve;
-            });
-          },
-        };
-      },
-    };
-    return {
-      ctx: {
-        event: {
-          subscribe({ signal }) {
-            signal.addEventListener('abort', () => resolveNext?.({ done: true, value: undefined }), { once: true });
-            return iterator;
-          },
+    const subscribeOptions = [];
+    const ctx = {
+      app: { name: 'opencode', version: '2.2.7' },
+      options: undefined,
+      session: { get: jest.fn().mockResolvedValue({ title: 'Host title' }) },
+      event: {
+        subscribe(opts) {
+          subscribeOptions.push(opts);
+          opts.signal.addEventListener('abort', () => resolveNext?.({ done: true, value: undefined }), { once: true });
+          return {
+            [Symbol.asyncIterator]() {
+              return {
+                next() {
+                  return new Promise((resolve) => {
+                    if (queue.length > 0) {
+                      resolve({ done: false, value: queue.shift() });
+                      return;
+                    }
+                    resolveNext = resolve;
+                  });
+                },
+              };
+            },
+          };
         },
       },
+      ...extra,
     };
+    return { ctx, subscribeOptions };
   }
 
-  it("setup() returns without awaiting the subscribe loop (returns a cleanup function immediately)", async () => {
-    const { ctx } = makeFakeCtx([]);
-    const cleanup = await PluginV2.setup(ctx, { _todoConfiguredExplicitly: false });
-    expect(typeof cleanup).toBe('function');
-    await cleanup();
-  });
-
-  it('cleanup aborts the subscription without an unhandled rejection', async () => {
-    const { ctx } = makeFakeCtx([]);
-    const cleanup = await PluginV2.setup(ctx, { _todoConfiguredExplicitly: false });
-    await expect(cleanup()).resolves.toBeUndefined();
-  });
-
-  it('the todo warning fires exactly once when explicitly configured, never when unconfigured', async () => {
-    const original = process.stderr.write.bind(process.stderr);
-    const lines = [];
-    process.stderr.write = (chunk) => { lines.push(String(chunk)); return true; };
-    try {
-      const { ctx: ctxA } = makeFakeCtx([]);
-      const cleanupA = await PluginV2.setup(ctxA, { _todoConfiguredExplicitly: true });
-      await cleanupA();
-
-      const { ctx: ctxB } = makeFakeCtx([]);
-      const cleanupB = await PluginV2.setup(ctxB, { _todoConfiguredExplicitly: false });
-      await cleanupB();
-    } finally {
-      process.stderr.write = original;
-    }
-    const todoWarnings = lines.filter((l) => l.includes('Todo-completion notifications are not available'));
-    expect(todoWarnings).toHaveLength(1);
-  });
-
-  it('a throwing handler does not terminate the subscription -- a later event is still processed', async () => {
-    // Both events are malformed the same way (resources: null, which
-    // normalizeV2Event's default-parameter guard does NOT catch, since
-    // defaults only apply to `undefined`, not `null` -- this throws inside
-    // normalizeV2Event itself, not inside notifier.handle). If the loop
-    // died after the first throw, only ONE "event handling failed" log line
-    // would ever appear; if it correctly continues, BOTH do.
-    const malformed = (id) => ({
-      type: 'permission.asked',
-      data: { sessionID: 's1', action: 'read', resources: null, id },
-    });
-    const { ctx, } = makeFakeCtx([malformed('req-1'), malformed('req-2')]);
-
+  /** Runs `setup` against `ctx`, lets queued events drain, and returns the parsed stderr JSON lines. */
+  async function runSetup(ctx) {
     const original = process.stderr.write.bind(process.stderr);
     const lines = [];
     process.stderr.write = (chunk) => { lines.push(String(chunk)); return true; };
     let cleanup;
     try {
-      cleanup = await PluginV2.setup(ctx, { _todoConfiguredExplicitly: false });
-      // Let the detached loop's microtasks/promises settle for both queued events.
+      cleanup = await PluginV2.setup(ctx);
       await new Promise((r) => setTimeout(r, 20));
     } finally {
       process.stderr.write = original;
       await cleanup?.();
     }
+    return lines.map((l) => JSON.parse(l));
+  }
 
-    const failureLines = lines.filter((l) => l.includes('event handling failed'));
-    expect(failureLines).toHaveLength(2);
-    const terminatedLines = lines.filter((l) => l.includes('event subscription loop terminated unexpectedly'));
-    expect(terminatedLines).toHaveLength(0);
+  it('setup() returns a cleanup function without awaiting the subscribe loop', async () => {
+    const { ctx } = makeFakeCtx();
+    const cleanup = await PluginV2.setup(ctx);
+    expect(typeof cleanup).toBe('function');
+    await expect(cleanup()).resolves.toBeUndefined();
+  });
+
+  it('subscribes only to the mapped event types', async () => {
+    const { ctx, subscribeOptions } = makeFakeCtx();
+    await runSetup(ctx);
+    expect(subscribeOptions).toHaveLength(1);
+    expect(subscribeOptions[0].types).toEqual([...SUBSCRIBED_EVENT_TYPES]);
+    expect(subscribeOptions[0].signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it('writes every log entry as one JSON line with the service name', async () => {
+    const { ctx } = makeFakeCtx();
+    const entries = await runSetup(ctx);
+    expect(entries.length).toBeGreaterThan(0);
+    for (const entry of entries) {
+      expect(entry).toMatchObject({ service: 'opencode-notify' });
+      expect(['debug', 'info', 'warn', 'error']).toContain(entry.level);
+      expect(typeof entry.message).toBe('string');
+    }
+  });
+
+  it('logs setup with the plugin runtime and host version', async () => {
+    const { ctx } = makeFakeCtx();
+    const entries = await runSetup(ctx);
+    const setupEntry = entries.find((e) => e.message === 'Plugin setup complete');
+    expect(setupEntry).toMatchObject({ level: 'info', runtime: 'v2', appVersion: '2.2.7' });
+    expect(typeof setupEntry.version).toBe('string');
+  });
+
+  it('logs the resolved config source without secret values', async () => {
+    const { ctx } = makeFakeCtx([], {
+      options: { desktop: false, onClickCommand: 'secret-command', webhooks: [{ url: 'https://hooks.example.com/SECRET-TOKEN' }] },
+    });
+    const entries = await runSetup(ctx);
+    const resolvedEntry = entries.find((e) => e.message === 'Resolved configuration');
+    expect(resolvedEntry).toMatchObject({ level: 'info', sources: ['options'], desktop: false, webhookCount: 1, hasOnClickCommand: true });
+    expect(JSON.stringify(entries)).not.toMatch(/SECRET-TOKEN|secret-command/);
+  });
+
+  it('reports the defaults source when neither the config file nor options are present', async () => {
+    const { ctx } = makeFakeCtx();
+    const entries = await runSetup(ctx);
+    expect(entries.find((e) => e.message === 'Resolved configuration')).toMatchObject({ sources: ['defaults'] });
+  });
+
+  it('applies plugin options: a disabled terminal bell and desktop produce no notification work', async () => {
+    const { ctx } = makeFakeCtx([CANNED_EVENTS['session.execution.succeeded']], {
+      options: { desktop: false, terminalBell: false, notifications: { taskFinished: false } },
+    });
+    const entries = await runSetup(ctx);
+    expect(entries.find((e) => e.message === 'Resolved configuration')).toMatchObject({ desktop: false, terminalBell: false });
+    expect(entries.filter((e) => e.level === 'error')).toEqual([]);
+  });
+
+  // spec: openspec/specs/notification-dispatch/spec.md
+  it('A startup warning is emitted only when todo notifications were explicitly configured', async () => {
+    const { ctx } = makeFakeCtx([], { options: { notifications: { todoCompleted: true } } });
+    const entries = await runSetup(ctx);
+
+    expect(entries.filter((e) => e.level === 'warn' && /Todo-completion/.test(e.message))).toHaveLength(1);
+  });
+
+  // spec: openspec/specs/notification-dispatch/spec.md
+  it('No startup warning when todo notifications were never configured', async () => {
+    const { ctx } = makeFakeCtx();
+    const entries = await runSetup(ctx);
+
+    expect(entries.filter((e) => e.level === 'warn')).toEqual([]);
+  });
+
+  // spec: openspec/specs/notification-dispatch/spec.md
+  it('Notifies when session execution succeeds', async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = jest.fn().mockResolvedValue({ ok: true });
+    globalThis.fetch = fetchMock;
+    try {
+      const { ctx } = makeFakeCtx([{ type: 'session.execution.succeeded', data: { sessionID: 's1' } }], {
+        options: { desktop: false, terminalBell: false, skipIfFocused: false, webhooks: [{ url: 'https://hooks.example.com/x' }] },
+      });
+      await runSetup(ctx);
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toMatchObject({ event: 'session_idle', sessionID: 's1' });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it('logs each mapped event at debug level with only its type and kinds', async () => {
+    const { ctx } = makeFakeCtx(
+      [{ type: 'session.renamed', data: { sessionID: 's1', title: 'Private title' } }],
+      { options: { desktop: false, terminalBell: false } },
+    );
+    const entries = await runSetup(ctx);
+    const debugEntry = entries.find((e) => e.level === 'debug');
+    expect(debugEntry).toMatchObject({ eventType: 'session.renamed', kinds: ['session-titled'] });
+    expect(JSON.stringify(entries)).not.toContain('Private title');
+  });
+
+  it('looks up an unknown session title through the host', async () => {
+    const { ctx } = makeFakeCtx(
+      [CANNED_EVENTS['permission.asked']],
+      { options: { desktop: false, terminalBell: false } },
+    );
+    await runSetup(ctx);
+    expect(ctx.session.get).toHaveBeenCalledWith({ sessionID: 's1' });
+  });
+
+  it('a throwing handler does not terminate the subscription -- a later event is still processed', async () => {
+    // resources: null defeats normalizeV2Event's default-parameter guard
+    // (defaults apply only to `undefined`), so this throws inside the
+    // normalizer; if the loop died after the first throw only ONE failure
+    // would be logged.
+    const malformed = (id) => ({ type: 'permission.asked', data: { sessionID: 's1', action: 'read', resources: null, id } });
+    const { ctx } = makeFakeCtx([malformed('req-1'), malformed('req-2')]);
+    const entries = await runSetup(ctx);
+
+    const failures = entries.filter((e) => e.message === 'Event handling failed');
+    expect(failures).toHaveLength(2);
+    expect(failures[0]).toMatchObject({ level: 'error', eventType: 'permission.asked', errorName: 'TypeError' });
+    expect(entries.filter((e) => e.message === 'Event subscription loop terminated unexpectedly')).toHaveLength(0);
   });
 });
